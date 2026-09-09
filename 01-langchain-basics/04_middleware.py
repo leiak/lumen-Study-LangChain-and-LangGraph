@@ -326,6 +326,7 @@ def demo_summarization() -> None:
                 max_tokens_before_summary=4000,
                 # 摘要后保留最近 N 条消息 (其余压成 SystemMessage)
                 messages_to_keep=4,
+                summary_prompt=""
             ),
         ],
     )

@@ -16,7 +16,7 @@ build/
 venv/
 env/
 .venv/
-.env.local
+.env
 .env
 
 # Pytest

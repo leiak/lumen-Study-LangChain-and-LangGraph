@@ -1,3 +1,5 @@
+
+
 """05_retrieval.py — Retrieval (RAG): 给 Agent 接私有知识库.
 
 学完这个模块你能回答:
@@ -20,6 +22,8 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+
+from langchain_community.embeddings import MiniMaxEmbeddings
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -100,7 +104,9 @@ def prepare_disk_docs(tmp_dir: Path) -> list[Document]:
 def demo_prepare_docs() -> list[Document]:
     print(">>> 内存直接构造:")
     in_mem = prepare_in_memory_docs()
-    print(f"  文档数: {len(in_mem)}, 元数据: {in_mem[0].metadata}")
+    print(f"  原始文档数: {in_mem}")
+    print(f"  原始文档数2: {in_mem.__len__()}")
+    print(f"  文档数: {len(in_mem)}, 元数据metadata: {in_mem[0].metadata}, 元数据page_content: {in_mem[0].page_content}")
 
     print("\n>>> 磁盘加载 (用 TextLoader):")
     with tempfile.TemporaryDirectory() as tmp:
@@ -155,14 +161,17 @@ def get_embeddings():
     if openai_key or minimax_key:
         from langchain_openai import OpenAIEmbeddings
 
-        return OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            api_key=openai_key or minimax_key,
-            base_url=(
-                os.getenv("MINIMAX_BASE_URL")
-                or os.getenv("OPENAI_BASE_URL")
-                or "https://api.openai.com/v1"
-            ),
+        # return OpenAIEmbeddings(
+        #     model="embo-01",
+        #     api_key=openai_key or minimax_key,
+        #     base_url=(
+        #         "https://api.minimax.chat/v1/embeddings"
+        #     ),
+        # )
+        return MiniMaxEmbeddings(
+            model="embo-01",
+            api_key=minimax_key,
+            group_id=2046414028250550829,
         )
 
     # 无 key 时用 DeterministicFakeEmbedding (hash 模拟, 检索质量差但流程可演示)
@@ -414,11 +423,11 @@ if __name__ == "__main__":
     vectorstore = demo_vector_store(chunks)
 
     # 检索的 5 种玩法
-    demo_similarity(vectorstore)
-    demo_mmr(vectorstore)
-    demo_metadata_filter(vectorstore)
-    demo_score_threshold(vectorstore)
-    demo_persistence(vectorstore)
+    # demo_similarity(vectorstore)
+    # demo_mmr(vectorstore)
+    # demo_metadata_filter(vectorstore)
+    # demo_score_threshold(vectorstore)
+    # demo_persistence(vectorstore)
 
     # RAG Agent (LLM 驱动, M3 可能不稳)
     try:
