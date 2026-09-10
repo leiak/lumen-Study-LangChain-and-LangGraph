@@ -36,6 +36,7 @@ load_dotenv(_ROOT / ".env.example", override=False)
 
 _PLACEHOLDER_VALUES = {
     "your_minimax_api_key_here",
+    "your_deepseek_api_key_here",
     "your_api_key_here",
     "sk-...",
     "",
@@ -46,42 +47,85 @@ def _is_real_key(value: str | None) -> bool:
     return bool(value) and value.strip().lower() not in _PLACEHOLDER_VALUES
 
 
+def _make_anthropic_llm(temperature: float, **kwargs) -> BaseChatModel:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not _is_real_key(api_key):
+        raise ValueError("ANTHROPIC_API_KEY 未设置或为占位符")
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    return init_chat_model(
+        model=f"anthropic:{model}", temperature=temperature, api_key=api_key, **kwargs,
+    )
+
+
+def _make_deepseek_llm(temperature: float, **kwargs) -> BaseChatModel:
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not _is_real_key(api_key):
+        raise ValueError("DEEPSEEK_API_KEY 未设置或为占位符")
+    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    return init_chat_model(
+        model=f"openai:{model}", temperature=temperature, api_key=api_key,
+        base_url=base_url, **kwargs,
+    )
+
+
+def _make_minimax_llm(temperature: float, **kwargs) -> BaseChatModel:
+    api_key = os.getenv("MINIMAX_API_KEY")
+    if not _is_real_key(api_key):
+        raise ValueError("MINIMAX_API_KEY 未设置或为占位符")
+    model = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    return init_chat_model(
+        model=f"openai:{model}", temperature=temperature, api_key=api_key,
+        base_url=base_url, **kwargs,
+    )
+
+
+def _make_openai_llm(temperature: float, **kwargs) -> BaseChatModel:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not _is_real_key(api_key):
+        raise ValueError("OPENAI_API_KEY 未设置或为占位符")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    return init_chat_model(
+        model=f"openai:{model}", temperature=temperature, api_key=api_key, **kwargs,
+    )
+
+
+_PROVIDERS = {
+    "anthropic": _make_anthropic_llm,
+    "deepseek": _make_deepseek_llm,
+    "minimax": _make_minimax_llm,
+    "openai": _make_openai_llm,
+}
+
+
 def get_llm(temperature: float = 0.0, **kwargs) -> BaseChatModel:
-    # 1. Anthropic
-    if _is_real_key(os.getenv("ANTHROPIC_API_KEY")):
-        model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-        return init_chat_model(
-            model=f"anthropic:{model}",
-            temperature=temperature,
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-            **kwargs,
-        )
-    # 2. MiniMax
-    if _is_real_key(os.getenv("MINIMAX_API_KEY")):
-        model = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
-        base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
-        return init_chat_model(
-            model=f"openai:{model}",
-            temperature=temperature,
-            api_key=os.getenv("MINIMAX_API_KEY"),
-            base_url=base_url,
-            **kwargs,
-        )
-    # 3. OpenAI
-    if _is_real_key(os.getenv("OPENAI_API_KEY")):
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        return init_chat_model(
-            model=f"openai:{model}",
-            temperature=temperature,
-            api_key=os.getenv("OPENAI_API_KEY"),
-            **kwargs,
-        )
+    # A. LLM_PROVIDER 强制选择 (最高优先级,无视 shell env)
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if provider:
+        factory = _PROVIDERS.get(provider)
+        if factory is None:
+            raise RuntimeError(
+                f"LLM_PROVIDER={provider!r} 不在 {sorted(_PROVIDERS)} 里。"
+            )
+        try:
+            return factory(temperature, **kwargs)
+        except ValueError as e:
+            raise RuntimeError(f"LLM_PROVIDER={provider} 但 {e}") from e
+
+    # B/C/D/E. 自动检测: 谁先填了真实 key 就用谁
+    for factory in (
+        _make_anthropic_llm, _make_deepseek_llm, _make_minimax_llm, _make_openai_llm,
+    ):
+        try:
+            return factory(temperature, **kwargs)
+        except ValueError:
+            continue
+
     raise RuntimeError(
         "未找到有效的 LLM API key。\n"
-        "请在项目根目录的 .env 文件中设置以下之一:\n"
-        "  - ANTHROPIC_API_KEY=sk-ant-...\n"
-        "  - MINIMAX_API_KEY=...\n"
-        "  - OPENAI_API_KEY=sk-..."
+        "请在 .env 设置 ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY\n"
+        "或者用 LLM_PROVIDER=deepseek 之类强制指定(优先级最高)。"
     )
 
 

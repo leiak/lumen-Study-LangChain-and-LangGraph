@@ -313,15 +313,16 @@ def demo_parallel() -> None:
     llm = get_llm()
 
     def tech_research(state: ParallelState) -> dict:
-        r = llm.invoke(f"从技术角度分析: {state['topic']}, 不超过 50 字。")
+        r = llm.invoke(f"从技术角度分析: {state['topic']}")
+        print(f"技术角度返回的内容 :{r}")
         return {"research_results": [f"[技术] {r.content}"]}
 
     def market_research(state: ParallelState) -> dict:
-        r = llm.invoke(f"从市场角度分析: {state['topic']}, 不超过 50 字。")
+        r = llm.invoke(f"从市场角度分析: {state['topic']}")
         return {"research_results": [f"[市场] {r.content}"]}
 
     def user_research(state: ParallelState) -> dict:
-        r = llm.invoke(f"从用户角度分析: {state['topic']}, 不超过 50 字。")
+        r = llm.invoke(f"从用户角度分析: {state['topic']}")
         return {"research_results": [f"[用户] {r.content}"]}
 
     def synthesize(state: ParallelState) -> dict:
@@ -514,22 +515,22 @@ if __name__ == "__main__":
         or os.getenv("MINIMAX_API_KEY")
         or os.getenv("OPENAI_API_KEY")
     ):
-        print("请先在 .env 中设置 ANTHROPIC_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY")
+        print("请先在 .env 中设置 ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY")
         raise SystemExit(1)
 
     # 1-5 基础图
-    demo_minimal_graph()
-    demo_messages_state()
-    demo_multi_node()
-    demo_conditional_edge()
-    demo_loop_edge()
-
-    # 6-7 并行
+    # demo_minimal_graph()
+    # demo_messages_state()
+    # demo_multi_node()
+    # demo_conditional_edge()
+    # demo_loop_edge()
+    #
+    # # 6-7 并行
     demo_parallel()
-    demo_send_dynamic_fanout()
-
-    # 8-9 进阶
-    demo_reducers()
-    demo_visualize()
+    # demo_send_dynamic_fanout()
+    #
+    # # 8-9 进阶
+    # demo_reducers()
+    # demo_visualize()
 
     print("\n[OK] 06_state_graph.py 全部 demo 跑完。")

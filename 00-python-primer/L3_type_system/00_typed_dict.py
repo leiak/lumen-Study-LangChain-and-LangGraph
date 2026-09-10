@@ -106,7 +106,7 @@ def demo_langgraph_state_pattern() -> None:
 
 
 if __name__ == "__main__":
-    setup()
+    #setup()
     demo_basic_typed_dict()
     demo_total_false()
     demo_not_required()

@@ -691,7 +691,7 @@ if __name__ == "__main__":
         or os.getenv("MINIMAX_API_KEY")
         or os.getenv("OPENAI_API_KEY")
     ):
-        print("请先在 .env 中设置 ANTHROPIC_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY")
+        print("请先在 .env 中设置 ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY")
         raise SystemExit(1)
 
     # 1. 准备知识库
