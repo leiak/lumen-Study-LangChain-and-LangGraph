@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph_supervisor import create_supervisor
 
 from middleware import redact_pii, tone_prompt
@@ -46,6 +45,7 @@ def _make_weather_agent(model):
             "你是 WeatherAgent. 用户问天气时, 调 get_weather 工具, "
             "用中文简洁回答 (不超过 30 字)."
         ),
+        name="WeatherAgent",
     )
 
 
@@ -57,6 +57,7 @@ def _make_calc_agent(model):
             "你是 CalcAgent. 用户问数学时, 调 calc 工具, "
             "把结果用一句话告诉用户."
         ),
+        name="CalcAgent",
     )
 
 
@@ -67,6 +68,7 @@ def _make_notes_agent(model):
         system_prompt=(
             "你是 NotesAgent. 读/写笔记. 调工具后用中文简短回复."
         ),
+        name="NotesAgent",
     )
 
 
@@ -78,6 +80,7 @@ def _make_orders_agent(model):
             "你是 OrdersAgent. 查订单 / 退款. 调工具后用中文简短回复. "
             "退款是危险操作, 必须经 HumanInTheLoopMiddleware 审批."
         ),
+        name="OrdersAgent",
     )
 
 
