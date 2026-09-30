@@ -1,14 +1,19 @@
-# LangChain 1.x + LangGraph 1.x 核心 (核心包必须 lockstep 1.0.x)
+# LangChain 1.x + LangGraph 1.x 核心
+# 注意: lockstep 规则已被 langgraph-supervisor 打破:
+#   langgraph-supervisor 0.0.31 需要 langgraph.prebuilt.InjectedState
+#   → langgraph 1.0.x 不兼容,被迫升到 1.2.x → langchain-core 跟着到 1.6.x
+#   实测 langchain 1.0.2 + langchain-core 1.6.x + langgraph 1.2.x 三方协同 OK.
 langchain==1.0.2
-langchain-core==1.0.1
+langchain-core>=1.6,<2.0
 langchain-openai>=1.0            # OpenAI 兼容协议 (含 MiniMax / DeepSeek / 其它)
 langchain-ollama>=1.0            # Ollama 本地 (可选)
 langchain-text-splitters>=1.0
 langchain-community<1.0          # 1.0 必须 pin,<1.0 留在 0.3 末班车
 
 # LangGraph 1.x
-langgraph>=1.0
+langgraph>=1.2,<2.0
 langgraph-checkpoint>=2.0        # 持久化
+langgraph-supervisor>=0.0.31     # L4 supervisor/handoff 拓扑
 
 # LangSmith
 langsmith>=0.4
