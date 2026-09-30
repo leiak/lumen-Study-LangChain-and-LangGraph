@@ -66,18 +66,25 @@ def redact_pii(request, handler):
 # ============================================================
 @dynamic_prompt
 def tone_prompt(request) -> str:
-    """读全部 HumanMessage, 检测关键词切 system prompt."""
-    history = [
+    """根据用户最近的措辞动态追加语气 modifier (不覆盖 specialist 的 system_prompt).
+
+    ⚠️ `dynamic_prompt` 装饰器执行 `request.system_prompt = prompt` — 它是 setter,
+       不是 appender。如果直接返回 "用正式语气...", 会覆盖 create_agent 里传进去
+       的 specialist 角色 ("你是 WeatherAgent..."), 导致 specialist 失去 domain role.
+       所以这里必须以 request.system_prompt 为 base, 在末尾追加语气行.
+    """
+    base = request.system_prompt or ""
+    history_msgs = [
         m.content for m in request.messages
         if isinstance(m, HumanMessage) and isinstance(m.content, str)
     ]
-    full = " ".join(history)
+    last_text = history_msgs[-1] if history_msgs else ""
 
-    if "正式" in full:
-        return "你是智能个人助手. 用正式语气回答,使用'您'."
-    if "哈哈" in full or "随便" in full or "lol" in full.lower():
-        return "你是智能个人助手. 用轻松幽默的语气回答,可以用 emoji."
-    return "你是智能个人助手. 回答简洁 (不超过 80 字), 必要时调工具."
+    if "正式" in last_text:
+        return base + "\n\n[语气修饰] 用正式语气回答,使用'您'."
+    if "哈哈" in last_text or "随便" in last_text:
+        return base + "\n\n[语气修饰] 用轻松幽默的语气回答,可以用 emoji."
+    return base
 
 
 __all__ = ["redact_pii", "tone_prompt"]

@@ -62,8 +62,9 @@ def _hitl():
 # 注意: 每个 specialist 都挂 [redact_pii, tone_prompt].
 #   - redact_pii: 在 LLM 看到 user message 之前脱敏 PII
 #   - tone_prompt: 根据历史动态切 system prompt (正式/轻松)
-# 装饰器 marker 自带去重 — 多个 specialist 挂同样的 middleware 不会
-# 让 LLM 被调用两次 (框架识别 marker, 单次注入).
+# redact_pii 是幂等的, tone_prompt 对相同输入返回相同 prompt — 多个 specialist
+# 挂同一 middleware 实例不会改变最终行为. (decorator marker 不去重, 只是这两个
+# 函数的语义天然 idempotent.)
 def _make_weather_agent(model):
     return create_agent(
         model=model,
@@ -97,7 +98,7 @@ def _make_notes_agent(model):
         tools=[read_note, write_note],
         system_prompt=(
             "你是 NotesAgent. 读/写笔记. 调工具后用中文简短回复. "
-            "写笔记是敏感操作, 必须经 HumanInTheLoopMiddleware 审批."
+            "写笔记是敏感操作, 必须经人工审批."
         ),
         name="NotesAgent",
         middleware=[redact_pii, tone_prompt, _hitl()],
@@ -111,7 +112,7 @@ def _make_orders_agent(model):
         tools=[get_order, refund_order],
         system_prompt=(
             "你是 OrdersAgent. 查订单 / 退款. 调工具后用中文简短回复. "
-            "退款是危险操作, 必须经 HumanInTheLoopMiddleware 审批."
+            "退款是危险操作, 必须经人工审批."
         ),
         name="OrdersAgent",
         middleware=[redact_pii, tone_prompt, _hitl()],
@@ -133,7 +134,7 @@ SUPERVISOR_PROMPT = """你是智能个人助手 supervisor. 根据用户问题, 
 def build_graph(model, *, checkpointer=None, store=None):
     """Build supervisor graph with middleware + checkpointer + store.
 
-    checkpointer / store 默认 None — 由 caller 注入 (cli.py 负责创建).
+    checkpointer / store 默认 None — 由 caller 注入 (T7 cli.py 会传进来).
 
     middleware 装配说明:
       - supervisor.compile() 是 StateGraph.compile(), 不支持 middleware=
@@ -152,7 +153,7 @@ def build_graph(model, *, checkpointer=None, store=None):
         agents=[weather_agent, calc_agent, notes_agent, orders_agent],
         model=model,
         prompt=SUPERVISOR_PROMPT,
-        output_mode="last_message",  # 只回 supervisor 看到的 final message
+        output_mode="last_message",  # 只回最后一个 specialist 的 final message (supervisor 内部 routing 不进 messages)
     )
 
     return supervisor.compile(checkpointer=checkpointer, store=store)
