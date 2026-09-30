@@ -17,7 +17,7 @@ langchain-community<1.0          # community 仍在 0.3.x,1.0 不兼容
 
 # LangGraph 1.x
 langgraph>=1.2,<2.0
-langgraph-checkpoint>=2.0,<3.0   # 持久化
+langgraph-checkpoint>=2.0,<5.0   # 持久化 (与 langgraph 1.2.x 配对的实际版本是 4.x)
 langgraph-supervisor>=0.0.31     # L4 supervisor/handoff 拓扑;0.0.x 预发布版,08-cli-assistant/ 在用
 
 # LangSmith
