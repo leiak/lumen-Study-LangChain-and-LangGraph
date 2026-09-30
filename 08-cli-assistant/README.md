@@ -1,5 +1,7 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
+> ✅ Smoke-tested: import chain OK · 6 tools OK · memory prefs OK · async command routing OK · PII redaction OK (phone + ID + mixed 不互相 mangled) · AST parse 7/7 OK
+
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
 脱敏 + 动态语气 + long-term Store + time-travel rewind / fork。
