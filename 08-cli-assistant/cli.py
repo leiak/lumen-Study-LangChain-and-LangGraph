@@ -2,11 +2,11 @@
 
 REPL 流程:
   1. read() 读一行 stdin
-  2. 以 "/" 开头 → handle_command() (内置命令)
-  3. 普通文本   → run_turn() 异步流式调 supervisor
+  2. 以 "/" 开头 → await handle_command() (内置命令)
+  3. 普通文本   → await run_turn() 异步流式调 supervisor
   4. run_turn 内部: astream(stream_mode="messages") + 逐字 print
   5. 检测到 state.next 非空 + 有 interrupt → handle_hitl()
-  6. 用户输入 a/e/r → Command(resume=...) 恢复
+  6. 用户输入 a/r → Command(resume=...) 恢复
 
 命令:
   /history   列出 checkpoints
@@ -14,7 +14,7 @@ REPL 流程:
   /fork TXT  在新 thread 续走, 注入 TXT 作为新的人类消息
   /memory    查看/编辑长期偏好
   /help      帮助
-  /quit      退出
+  /quit, /exit  退出
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ WELCOME = """
 │    /fork TXT  改历史后在新 thread 续走      │
 │    /memory    查看/编辑长期偏好              │
 │    /help      帮助                           │
-│    /quit      退出                           │
+│    /quit, /exit  退出                        │
 ╰─────────────────────────────────────────────╯
 """
 
@@ -60,13 +60,13 @@ HELP_TEXT = """
   /memory            查看偏好
   /memory <key> <v>  设置偏好 (nickname / city / language / user_*)
   /help              本帮助
-  /quit              退出
+  /quit, /exit       退出
 
 正常对话:
   - "北京天气?"     → 派 WeatherAgent
   - "123 * 456"     → 派 CalcAgent
   - "查订单 #123"    → 派 OrdersAgent
-  - "退款 #123 100"  → OrdersAgent 触发 HITL (输入 a/e/r 决策)
+  - "退款 #123 100"  → OrdersAgent 触发 HITL (输入 a/r 决策)
   - "写笔记 todo ..." → NotesAgent 触发 HITL
 """
 
@@ -93,6 +93,7 @@ class CLI:
         self.active_thread_id = thread_id  # 主 thread; fork 后会变
         # rewind 用的 checkpoint_id 覆盖 - 设了之后 config() 会带上它,
         # 后续 invoke 会从 history[n] 这个 checkpoint 开始 (走 time-travel replay)
+        # ⚠️ 一次性: run_turn 完成后会清掉, 不然会一直卡在分支上
         self._rewind_ckpt: str | None = None
 
     @property
@@ -114,19 +115,20 @@ class CLI:
         print(f">>> user prefs: {get_prefs(self.store, self.store_ns)}")
         print()
 
-        loop = asyncio.get_event_loop()
+        # 3.10+ 用 get_running_loop, 不再 get_event_loop (后者已 deprecate)
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 line = await loop.run_in_executor(None, input, "你> ")
             except (EOFError, KeyboardInterrupt):
-                print("\n再见")
+                print("\n再见 👋")
                 return
 
             line = line.strip()
             if not line:
                 continue
             if line.startswith("/"):
-                should_exit = self.handle_command(line)
+                should_exit = await self.handle_command(line)
                 if should_exit:
                     return
                 continue
@@ -135,15 +137,18 @@ class CLI:
             await self.run_turn(line)
 
     # --------------------------------------------------------
-    # 内置命令
+    # 内置命令 (async, 因为 _cmd_fork 需要 await)
     # --------------------------------------------------------
-    def handle_command(self, line: str) -> bool:
-        """处理 / 命令. 返回 True = 退出 REPL."""
+    async def handle_command(self, line: str) -> bool:
+        """处理 / 命令. 返回 True = 退出 REPL.
+
+        async: 让 /fork 之类的子命令能 await 流式输出, 不再 asyncio.run() 嵌套 loop.
+        """
         parts = line.split(maxsplit=2)
         cmd = parts[0].lower()
 
         if cmd == "/quit" or cmd == "/exit":
-            print("再见")
+            print("再见 👋")
             return True
 
         if cmd == "/help":
@@ -166,10 +171,12 @@ class CLI:
             return False
 
         if cmd == "/fork":
-            if len(parts) < 2:
+            # parts 用 maxsplit=2, 但 fork text 可能含空格, 直接从原 line 截
+            text = line[len("/fork"):].strip()
+            if not text:
                 print("用法: /fork <text>")
                 return False
-            self._cmd_fork(parts[1])
+            await self._cmd_fork(text)
             return False
 
         if cmd == "/memory":
@@ -185,7 +192,10 @@ class CLI:
         return False
 
     def _cmd_history(self) -> None:
-        history = list(self.graph.get_state_history(self.config))
+        # ⚠️ 用干净的 config (不带 checkpoint_id) 才能拿到整条时间线;
+        # 带 checkpoint_id 时 get_state_history 只返回该 ckpt 及之后, 看不到前面.
+        history_cfg = {"configurable": {"thread_id": self.active_thread_id}}
+        history = list(self.graph.get_state_history(history_cfg))
         print(f"\n>>> 共 {len(history)} 个 checkpoint (history[0]=最新):")
         for i, snap in enumerate(history):
             ckpt_short = snap.config["configurable"]["checkpoint_id"][:8]
@@ -194,7 +204,9 @@ class CLI:
             print(f"  [{i:>3}] ckpt={ckpt_short}... | msgs={n_msgs} | next={next_node}")
 
     def _cmd_rewind(self, n: int) -> None:
-        history = list(self.graph.get_state_history(self.config))
+        # 同样用干净 config 拿完整 history
+        history_cfg = {"configurable": {"thread_id": self.active_thread_id}}
+        history = list(self.graph.get_state_history(history_cfg))
         if n < 0 or n >= len(history):
             print(f"索引 {n} 越界, 范围 [0, {len(history)-1}]")
             return
@@ -202,6 +214,7 @@ class CLI:
         ckpt = snap.config["configurable"]["checkpoint_id"]
         # 把 checkpoint_id 注入 config - 下次 astream 从 history[n] 这个
         # checkpoint 重新走 (LangGraph 1.x time-travel replay 语义).
+        # 一次性: run_turn 完成后会清掉.
         self._rewind_ckpt = ckpt
         print(
             f">>> 回到 history[{n}] (ckpt={ckpt[:8]}..., "
@@ -209,9 +222,10 @@ class CLI:
             f"下次输入会以该 checkpoint 为起点."
         )
 
-    def _cmd_fork(self, text: str) -> None:
+    async def _cmd_fork(self, text: str) -> None:
         """在最新 checkpoint 上追加 text, 用 update_state 创建新 thread."""
-        history = list(self.graph.get_state_history(self.config))
+        history_cfg = {"configurable": {"thread_id": self.active_thread_id}}
+        history = list(self.graph.get_state_history(history_cfg))
         if not history:
             print(">>> 无历史, 无法 fork. 先跟助手对话几轮.")
             return
@@ -220,23 +234,33 @@ class CLI:
             {"messages": [HumanMessage(content=text)]},
         )
         new_thread = new_config["configurable"]["thread_id"]
+        # ⚠️ 切换 active_thread_id 到新 thread — 后续 /history 和 run_turn 都走这条
+        # 否则会卡在原 thread, 看 fork 后的续走消息
+        self.active_thread_id = new_thread
+        self._rewind_ckpt = None
         print(f">>> Fork 到新 thread: {new_thread}")
         print(f">>> 续走中...")
-        # 在 sync handle_command 里调 async - 用 asyncio.run 起新 loop
-        # (这里没问题, handle_command 不是 async, 不会被嵌套)
-        asyncio.run(self._continue_turn(new_config))
+        await self._continue_turn(new_config)
 
-    async def _continue_turn(self, config: dict) -> None:
-        """fork 后在新 thread 上继续 invoke (流式)."""
+    async def _stream_and_print(self, input_data: dict, config: dict) -> None:
+        """统一处理 astream + token 打印 + 错误捕获.
+
+        astream(stream_mode="messages") 永远 yield (BaseMessage, metadata) 二元组,
+        token 一定有 .content; 空 content 字符串自然跳过 (truthy check).
+        """
         try:
             async for token, _ in self.graph.astream(
-                {}, config=config, stream_mode="messages"
+                input_data, config=config, stream_mode="messages"
             ):
-                if hasattr(token, "content") and token.content:
+                if token.content:
                     print(token.content, end="", flush=True)
             print()
         except Exception as e:
             print(f"\n[error] {type(e).__name__}: {e}")
+
+    async def _continue_turn(self, config: dict) -> None:
+        """fork 后在新 thread 上继续 invoke (流式)."""
+        await self._stream_and_print({}, config)
 
     def _cmd_memory_show(self) -> None:
         prefs = get_prefs(self.store, self.store_ns)
@@ -257,22 +281,17 @@ class CLI:
     # --------------------------------------------------------
     async def run_turn(self, text: str) -> None:
         print()  # 换行
-        try:
-            async for token, _ in self.graph.astream(
-                {"messages": [HumanMessage(content=text)]},
-                config=self.config,
-                stream_mode="messages",
-            ):
-                if hasattr(token, "content") and token.content:
-                    print(token.content, end="", flush=True)
-            print()
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            print(f"\n[error] {err}")
-            return
+        await self._stream_and_print(
+            {"messages": [HumanMessage(content=text)]},
+            self.config,
+        )
 
         # 检查是否需要 HITL 审批
         await self._maybe_hitl()
+
+        # ⚠️ rewind 是一次性的: 跑完一个 turn 就清掉, 不然会一直 time-travel
+        # 在那个分支上, 后续 /history 也只会看到 rewound 之后的子集.
+        self._rewind_ckpt = None
 
     async def _maybe_hitl(self) -> None:
         """如果 graph 在 interrupt 状态, 走 HITL 流程."""
@@ -294,18 +313,16 @@ class CLI:
         else:
             print(f"  {intr}")
 
-        # 读决策
+        # 读决策 — 只暴露 approve / reject 给用户.
+        # LangGraph 协议层仍允许 ["approve","edit","reject"] 三种 type, 但 CLI 不提供 edit:
+        # 实战中 [e]dit 经常被误按成 approve, UX 上直接砍掉.
         try:
-            decision_raw = input("\n决策 [a]pprove / [e]dit / [r]eject: ").strip().lower()
+            decision_raw = input("\n决策 [a]pprove / [r]eject: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\n已取消")
             return
 
         if decision_raw.startswith("a"):
-            decision = {"decisions": [{"type": "approve"}]}
-        elif decision_raw.startswith("e"):
-            # 简化: edit 用原参数 (实战应让用户改具体字段)
-            print(">>> edit: 当前实现保留原参数, 实战可让用户改 amount 等")
             decision = {"decisions": [{"type": "approve"}]}
         elif decision_raw.startswith("r"):
             reason = input("拒绝原因: ").strip()
@@ -314,18 +331,9 @@ class CLI:
             print(f"未知决策 {decision_raw!r}, 默认 reject")
             decision = {"decisions": [{"type": "reject", "reason": "未知决策"}]}
 
-        # resume
-        try:
-            async for token, _ in self.graph.astream(
-                Command(resume=decision),
-                config=self.config,
-                stream_mode="messages",
-            ):
-                if hasattr(token, "content") and token.content:
-                    print(token.content, end="", flush=True)
-            print()
-        except Exception as e:
-            print(f"\n[error after HITL] {type(e).__name__}: {e}")
+        # resume - 走同一份 _stream_and_print 辅助
+        await self._stream_and_print(Command(resume=decision), self.config)
 
 
+# WELCOME / HELP_TEXT 不是 CLI 的 API, 但保留在 __all__ 方便单元测试 import 断言内容.
 __all__ = ["CLI", "WELCOME", "HELP_TEXT"]
