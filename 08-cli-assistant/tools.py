@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import operator
 import re
 from langchain_core.tools import tool
@@ -51,6 +52,7 @@ _BIN_OPS = {
     ast.Pow: operator.pow,
 }
 _UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_MAX_EXP = 10_000  # 幂运算指数上限, 防 9**9**9 这种 DoS
 
 
 @tool
@@ -58,13 +60,19 @@ def calc(expr: str) -> str:
     """(mock) 计算数学表达式, 仅支持 +-*/%** 和数字/括号.
 
     e.g. calc("2 + 3 * 4") -> "14"
+    1s 超时保护 (防 9**9**9 这种 DoS).
     """
     try:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as e:
         return f"语法错误: {e}"
     try:
-        result = _eval_node(tree.body)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_eval_node, tree.body)
+            try:
+                result = future.result(timeout=1.0)
+            except concurrent.futures.TimeoutError:
+                return "计算超时: 表达式过于复杂 (>1s), 已中止"
     except _UnsafeNode as e:
         return f"非法表达式: {e}"
     except Exception as e:
@@ -75,14 +83,21 @@ def calc(expr: str) -> str:
 def _eval_node(node: ast.AST) -> float | int:
     """递归求值, 只允许 Constant/BinOp/UnaryOp/Expression."""
     if isinstance(node, ast.Constant):
-        if not isinstance(node.value, (int, float)):
-            raise _UnsafeNode(f"常量类型 {type(node.value).__name__} 不允许")
-        return node.value
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _UnsafeNode(f"常量类型 {type(value).__name__} 不允许")
+        return value
     if isinstance(node, ast.BinOp):
         op = _BIN_OPS.get(type(node.op))
         if op is None:
             raise _UnsafeNode(f"运算符 {type(node.op).__name__} 不允许")
-        return op(_eval_node(node.left), _eval_node(node.right))
+        right = _eval_node(node.right)
+        # 幂运算指数上限, 在算 left**right 之前先检查 right
+        # (left**right 是 C-level 紧循环, GIL 不释放, ThreadPoolExecutor timeout 也救不了)
+        if op is operator.pow and isinstance(right, int) and abs(right) > _MAX_EXP:
+            raise _UnsafeNode(f"幂运算指数过大: {right} (>{_MAX_EXP})")
+        left = _eval_node(node.left)
+        return op(left, right)
     if isinstance(node, ast.UnaryOp):
         op = _UNARY_OPS.get(type(node.op))
         if op is None:
