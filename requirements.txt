@@ -3,17 +3,22 @@
 #   langgraph-supervisor 0.0.31 需要 langgraph.prebuilt.InjectedState
 #   → langgraph 1.0.x 不兼容,被迫升到 1.2.x → langchain-core 跟着到 1.6.x
 #   实测 langchain 1.0.2 + langchain-core 1.6.x + langgraph 1.2.x 三方协同 OK.
+#
+# Pin 风格说明 (有意为之,非对称):
+#   - langchain==1.0.2 是 exact,因下游 1.0.x 系列验证过与 1.6.x core 兼容,
+#     升 1.1.x 风险未知,先卡死;其它包放宽到 minor 范围,只在跨 major 时卡上界.
+#   - 所有上界都存在是为防 transitive dep 跨大版本再次打断 lockstep.
 langchain==1.0.2
 langchain-core>=1.6,<2.0
-langchain-openai>=1.0            # OpenAI 兼容协议 (含 MiniMax / DeepSeek / 其它)
-langchain-ollama>=1.0            # Ollama 本地 (可选)
-langchain-text-splitters>=1.0
-langchain-community<1.0          # 1.0 必须 pin,<1.0 留在 0.3 末班车
+langchain-openai>=1.0,<2.0       # OpenAI 兼容协议 (含 MiniMax / DeepSeek / 其它)
+langchain-ollama>=1.0,<2.0       # Ollama 本地 (可选)
+langchain-text-splitters>=1.0,<2.0
+langchain-community<1.0          # community 仍在 0.3.x,1.0 不兼容
 
 # LangGraph 1.x
 langgraph>=1.2,<2.0
-langgraph-checkpoint>=2.0        # 持久化
-langgraph-supervisor>=0.0.31     # L4 supervisor/handoff 拓扑
+langgraph-checkpoint>=2.0,<3.0   # 持久化
+langgraph-supervisor>=0.0.31     # L4 supervisor/handoff 拓扑;0.0.x 预发布版,08-cli-assistant/ 在用
 
 # LangSmith
 langsmith>=0.4
