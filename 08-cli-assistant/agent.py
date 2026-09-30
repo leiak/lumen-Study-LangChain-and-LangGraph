@@ -2,16 +2,21 @@
 
 架构:
   supervisor (create_supervisor)
-    ├── WeatherAgent  (create_agent, tools=[get_weather])
-    ├── CalcAgent     (create_agent, tools=[calc])
-    ├── NotesAgent    (create_agent, tools=[read_note, write_note])
-    └── OrdersAgent   (create_agent, tools=[get_order, refund_order])
+    ├── WeatherAgent  (create_agent, tools=[get_weather], middleware=[redact_pii, tone_prompt])
+    ├── CalcAgent     (create_agent, tools=[calc],          middleware=[redact_pii, tone_prompt])
+    ├── NotesAgent    (create_agent, tools=[read_note, write_note],
+    │                                       middleware=[redact_pii, tone_prompt, hitl])
+    └── OrdersAgent   (create_agent, tools=[get_order, refund_order],
+                                          middleware=[redact_pii, tone_prompt, hitl])
 
-HITL 挂 supervisor.compile() 上, 危险工具 (refund_order / write_note) 在
-HumanInTheLoopMiddleware 里登记, 触发时整个 supervisor graph 暂停.
-
-middleware (PII + dynamic_prompt) 挂 supervisor.compile() 上, supervisor
-调 LLM 前生效.
+重要坑 (spec review R3, fix commit):
+  - `supervisor.compile()` 是 `StateGraph.compile()`, 不接受 `middleware=`
+    kwarg — middleware 是 langchain.agents.create_agent 的特性, 不是
+    langgraph StateGraph 的特性.
+  - 解法: middleware 全部下沉到 4 个 specialist 的 `create_agent(middleware=[...])`.
+    装饰器 marker 自带去重, LLM 只看到最终状态.
+  - hitl 只挂 NotesAgent + OrdersAgent (其它 specialist 没有危险工具,
+    HumanInTheLoopMiddleware 挂上去不触发 = 浪费节点).
 
 复用:
   - 13_supervisor.py: langgraph_supervisor.create_supervisor
@@ -35,8 +40,30 @@ from tools import (
 )
 
 # ============================================================
+# HITL 配置 — 在有危险工具的 specialist 上挂
+# ============================================================
+# write_note / refund_order 都登记上, 触发时整个 subgraph 暂停等待
+# 人工审批 (cli.py 用 Command(resume=...) 恢复).
+_HITL_INTERRUPT_ON = {
+    "write_note": {"allowed_decisions": ["approve", "edit", "reject"]},
+    "refund_order": {"allowed_decisions": ["approve", "edit", "reject"]},
+}
+
+
+def _hitl():
+    """每次 build_graph 调一次, 避免多个 agent 共享同一个 middleware
+    实例导致 state schema 冲突 (middleware 会注入额外 state keys)."""
+    return HumanInTheLoopMiddleware(interrupt_on=_HITL_INTERRUPT_ON)
+
+
+# ============================================================
 # Specialist 工厂
 # ============================================================
+# 注意: 每个 specialist 都挂 [redact_pii, tone_prompt].
+#   - redact_pii: 在 LLM 看到 user message 之前脱敏 PII
+#   - tone_prompt: 根据历史动态切 system prompt (正式/轻松)
+# 装饰器 marker 自带去重 — 多个 specialist 挂同样的 middleware 不会
+# 让 LLM 被调用两次 (框架识别 marker, 单次注入).
 def _make_weather_agent(model):
     return create_agent(
         model=model,
@@ -46,6 +73,7 @@ def _make_weather_agent(model):
             "用中文简洁回答 (不超过 30 字)."
         ),
         name="WeatherAgent",
+        middleware=[redact_pii, tone_prompt],
     )
 
 
@@ -58,21 +86,26 @@ def _make_calc_agent(model):
             "把结果用一句话告诉用户."
         ),
         name="CalcAgent",
+        middleware=[redact_pii, tone_prompt],
     )
 
 
 def _make_notes_agent(model):
+    # write_note 是危险工具 → HITL
     return create_agent(
         model=model,
         tools=[read_note, write_note],
         system_prompt=(
-            "你是 NotesAgent. 读/写笔记. 调工具后用中文简短回复."
+            "你是 NotesAgent. 读/写笔记. 调工具后用中文简短回复. "
+            "写笔记是敏感操作, 必须经 HumanInTheLoopMiddleware 审批."
         ),
         name="NotesAgent",
+        middleware=[redact_pii, tone_prompt, _hitl()],
     )
 
 
 def _make_orders_agent(model):
+    # refund_order 是危险工具 → HITL
     return create_agent(
         model=model,
         tools=[get_order, refund_order],
@@ -81,6 +114,7 @@ def _make_orders_agent(model):
             "退款是危险操作, 必须经 HumanInTheLoopMiddleware 审批."
         ),
         name="OrdersAgent",
+        middleware=[redact_pii, tone_prompt, _hitl()],
     )
 
 
@@ -100,19 +134,19 @@ def build_graph(model, *, checkpointer=None, store=None):
     """Build supervisor graph with middleware + checkpointer + store.
 
     checkpointer / store 默认 None — 由 caller 注入 (cli.py 负责创建).
+
+    middleware 装配说明:
+      - supervisor.compile() 是 StateGraph.compile(), 不支持 middleware=
+        kwarg (那是 langchain.agents.create_agent 的特性).
+      - 所以 redact_pii / tone_prompt / hitl 都下沉到各 specialist 的
+        create_agent(middleware=[...]) 里.
+      - hitl 只在 NotesAgent / OrdersAgent 上挂 (其它 specialist 没有
+        危险工具, HITL 不会触发).
     """
     weather_agent = _make_weather_agent(model)
     calc_agent = _make_calc_agent(model)
     notes_agent = _make_notes_agent(model)
     orders_agent = _make_orders_agent(model)
-
-    hitl = HumanInTheLoopMiddleware(
-        interrupt_on={
-            # write_note / refund_order 触发 HITL
-            "write_note": {"allowed_decisions": ["approve", "edit", "reject"]},
-            "refund_order": {"allowed_decisions": ["approve", "edit", "reject"]},
-        },
-    )
 
     supervisor = create_supervisor(
         agents=[weather_agent, calc_agent, notes_agent, orders_agent],
@@ -121,11 +155,7 @@ def build_graph(model, *, checkpointer=None, store=None):
         output_mode="last_message",  # 只回 supervisor 看到的 final message
     )
 
-    return supervisor.compile(
-        checkpointer=checkpointer,
-        store=store,
-        middleware=[redact_pii, tone_prompt, hitl],
-    )
+    return supervisor.compile(checkpointer=checkpointer, store=store)
 
 
 __all__ = ["build_graph"]
