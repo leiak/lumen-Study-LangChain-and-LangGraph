@@ -53,30 +53,32 @@ CREATE TABLE IF NOT EXISTS order_items (
 -- ============================================================
 -- 示例数据 (5 用户 / 6 订单 / 6 明细) — 让 DataAgent 一开始就能出有意义的查询
 -- ============================================================
--- 重复跑安全: 先清, 再插
-DELETE FROM order_items;
-DELETE FROM orders;
-DELETE FROM users;
+-- 重复跑安全: 用 INSERT IGNORE (不是 DELETE + INSERT).
+-- 之前用 "DELETE FROM ...; INSERT INTO ..." 在第二次跑时会清空用户已添加的数据.
+-- 改成 INSERT IGNORE 后, 主键冲突的行静默跳过, 已存在的数据保留.
+-- 注意: 如果你想强制重置, 手动跑:
+--   DELETE FROM order_items; DELETE FROM orders; DELETE FROM users;
+--   <重新加载本文件>
 
-INSERT INTO users (name, city) VALUES
-  ('张三', '北京'),
-  ('李四', '上海'),
-  ('王五', '广州'),
-  ('赵六', '深圳'),
-  ('钱七', '杭州');
+INSERT IGNORE INTO users (id, name, city) VALUES
+  (1, '张三', '北京'),
+  (2, '李四', '上海'),
+  (3, '王五', '广州'),
+  (4, '赵六', '深圳'),
+  (5, '钱七', '杭州');
 
-INSERT INTO orders (user_id, amount, status) VALUES
-  (1, 199.00, 'paid'),
-  (1, 299.00, 'shipped'),
-  (2, 150.00, 'delivered'),
-  (3, 450.00, 'paid'),
-  (4, 89.00, 'refunded'),
-  (5, 1200.00, 'paid');
+INSERT IGNORE INTO orders (id, user_id, amount, status) VALUES
+  (1, 1, 199.00, 'paid'),
+  (2, 1, 299.00, 'shipped'),
+  (3, 2, 150.00, 'delivered'),
+  (4, 3, 450.00, 'paid'),
+  (5, 4, 89.00, 'refunded'),
+  (6, 5, 1200.00, 'paid');
 
-INSERT INTO order_items (order_id, product, quantity) VALUES
-  (1, 'LangChain 课程', 1),
-  (2, 'LangGraph 课程', 1),
-  (3, 'AI Agent 实战', 1),
-  (4, 'Python 进阶', 1),
-  (5, 'LangChain 课程', 1),
-  (6, '全套大礼包', 1);
+INSERT IGNORE INTO order_items (id, order_id, product, quantity) VALUES
+  (1, 1, 'LangChain 课程', 1),
+  (2, 2, 'LangGraph 课程', 1),
+  (3, 3, 'AI Agent 实战', 1),
+  (4, 4, 'Python 进阶', 1),
+  (5, 5, 'LangChain 课程', 1),
+  (6, 6, '全套大礼包', 1);
