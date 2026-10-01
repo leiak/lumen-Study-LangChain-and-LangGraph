@@ -24,6 +24,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import re
+import time
 from typing import Any
 
 import sqlparse
@@ -46,12 +47,26 @@ def _read_env() -> dict[str, str]:
     return {k: os.getenv(k, "") for k in required}
 
 
+# I2: engine 单例 (模块级缓存)
+_engine: Engine | None = None
+
+
 def build_engine() -> Engine:
-    """创建 SQLAlchemy engine. 每次都新建 (便宜, pymysql 走 connection pool).
+    """获取 SQLAlchemy engine (singleton).
+
+    I2: 模块级单例 — 第一次调用创建, 之后复用. 5 个工具各调一次 = 1 个 engine +
+    1 个 connection pool (默认 pool_size=5 + max_overflow=10 = 15 conns, 按需开
+    不全 eager). 之前每个调用方都新建 = 5 个 engine + 75 conns 上限, 浪费.
 
     缺 env → RuntimeError (给 main.py 提示);
     网络不通 → 第一次 connect 时抛 sqlalchemy.exc.OperationalError (tools.py 兜底).
+
+    ⚠️ env 改动不会让已缓存的实例重新创建. YAGNI — 教程/demo 阶段 env 改动后
+    手动重启 CLI 即可. 生产如要热重载, 应改用依赖注入.
     """
+    global _engine
+    if _engine is not None:
+        return _engine
     env = _read_env()
     # pymysql driver, utf8mb4 兼容 emoji/中文
     url = (
@@ -62,29 +77,44 @@ def build_engine() -> Engine:
     # pool_pre_ping=True: 长时间 idle 后, 第一次 query 自动发 SELECT 1 探活,
     # 防止 MySQL server timeout 杀掉连接后触发 "MySQL server has gone away".
     # pool_recycle=3600: 1 小时回收连接, 跟 MySQL wait_timeout 默认 8h 安全余量.
-    return create_engine(
+    _engine = create_engine(
         url,
         pool_pre_ping=True,
         pool_recycle=3600,
-        # 默认 query timeout 通过每条 statement 的 execution_options 设, 见 _execute()
     )
+    return _engine
 
 
 # ============================================================
-# Schema 摘要
+# Schema 摘要 — I1 模块级缓存 (60s TTL)
 # ============================================================
+# I1: 之前 describe_table("users") 调 get_schema_summary() 会跑 SHOW FULL COLUMNS
+# 对所有表 (N+1). 20 表 DB = 21 round-trips/次. 加 60s TTL 后, 多次 describe
+# 只触发一次实际查询. 缓存值是 (tables, describe, fetched_at), 用
+# time.monotonic() 比较; TTL 到期自动重 fetch (适合 LLM 在一次对话里反复问
+# schema). key 用 engine.url 区分不同 DB.
+#
+# ⚠️ 不暴露 invalidation API (YAGNI). 教程/demo 阶段 env 改动后重启 CLI 即可;
+# TTL 到期或重启进程会自然 refresh.
+_SCHEMA_CACHE: dict[str, tuple[list[str], dict[str, str], float]] = {}
+_SCHEMA_TTL = 60.0
+
+
 def get_schema_summary(engine: Engine) -> tuple[list[str], dict[str, str]]:
-    """返回 (tables, describe) 元组.
+    """返回 (tables, describe) 元组 (60s 模块级缓存).
 
     tables:   所有用户表名 (排除 mysql/information_schema/performance_schema)
     describe: {table_name: 格式化字符串 "列名 类型 注释\n..."}
     """
+    key = str(engine.url)  # 不同 DB 不同 key
+    now = time.monotonic()
+    cached = _SCHEMA_CACHE.get(key)
+    if cached is not None and (now - cached[2]) < _SCHEMA_TTL:
+        return cached[0], cached[1]
+
     with engine.connect() as conn:
         # SHOW TABLES 是 statement-level 命令, sqlparse 解析后 type 可能是 'SHOW'
-        rows = conn.execute(
-            text("SHOW TABLES"),
-            execution_options={"timeout": 10},
-        ).fetchall()
+        rows = conn.execute(text("SHOW TABLES")).fetchall()
         # 过滤系统 schema (虽然我们已经选定了 MYSQL_DATABASE, 但 SHOW TABLES
         # 在某些版本仍可能带库名限定, 这里只取最后一段)
         all_tables: list[str] = []
@@ -101,7 +131,6 @@ def get_schema_summary(engine: Engine) -> tuple[list[str], dict[str, str]]:
                 # SHOW FULL COLUMNS 给出 Type, Null, Key, Default, Extra
                 col_rows = conn.execute(
                     text(f"SHOW FULL COLUMNS FROM `{t}`"),
-                    execution_options={"timeout": 10},
                 ).fetchall()
                 lines = [f"  {t} 表结构:"]
                 for cr in col_rows:
@@ -118,6 +147,7 @@ def get_schema_summary(engine: Engine) -> tuple[list[str], dict[str, str]]:
                 # 单表失败不阻塞 (权限/视图问题)
                 describe[t] = f"  ({t} 结构读取失败)"
 
+    _SCHEMA_CACHE[key] = (all_tables, describe, now)
     return all_tables, describe
 
 
@@ -362,12 +392,15 @@ def _format_as_markdown(columns: list[str], rows: list[dict[str, Any]]) -> str:
     total = len(rows)
     display = rows[:_MAX_DISPLAY_ROWS]
 
-    # 列宽估算: 截断到 30 字符
+    # 列宽估算: 截断到 30 字符, 转义 markdown 表格的管道符 | (避免破坏表格布局)
     def _cell(v: Any) -> str:
         if v is None:
             return "NULL"
         s = str(v)
-        return s if len(s) <= 30 else s[:27] + "..."
+        if len(s) > 30:
+            s = s[:27] + "..."
+        # markdown 表格里 | 是列分隔符, 必须转义成 \|; 换行直接替换成空格
+        return s.replace("|", "\\|").replace("\n", " ")
 
     # header
     header = "| " + " | ".join(columns) + " |"
