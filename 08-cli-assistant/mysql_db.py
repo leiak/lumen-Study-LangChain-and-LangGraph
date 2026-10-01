@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import re
 from typing import Any
@@ -307,6 +308,7 @@ def _audit_sql(sql: str) -> str:
 # 执行 + 格式化结果
 # ============================================================
 _MAX_DISPLAY_ROWS = 50  # 给 LLM/用户看的前 N 行
+_QUERY_TIMEOUT_SEC = 10.0  # C2: 真实查询超时 (client-side kill via ThreadPoolExecutor)
 
 
 def execute_safe_select(engine: Engine, sql: str) -> tuple[str, list[dict[str, Any]]]:
@@ -318,19 +320,34 @@ def execute_safe_select(engine: Engine, sql: str) -> tuple[str, list[dict[str, A
     异常:
       ValueError — _audit_sql 拒绝 (抛到 tool, 转成 ToolMessage)
       sqlalchemy.exc.* — DB 错误 (语法/超时/连接断, 抛到 tool)
+
+    C2: 走 ThreadPoolExecutor 实现真实 client-side 10s 超时.
+    ⚠️ 注意: 这是 client-side kill (force-close 连接), 不是 server-side cancel.
+    真正的 server-side timeout 需要 MySQL 配合
+    `SET SESSION MAX_EXECUTION_TIME = 10000` (毫秒), 生产应开启.
     """
     safe_sql = _audit_sql(sql)  # 不合法 raise ValueError
 
-    with engine.connect() as conn:
-        # 10s timeout — SQLAlchemy 把它传到 pymysql, 写操作超时 (我们只 SELECT,
-        # 但大表 scan 可能耗时). 注意: 这是语句级 timeout, MySQL 端也要配合
-        # SET SESSION MAX_EXECUTION_TIME 才能真生效; 单纯 client timeout 不保证.
-        result = conn.execute(
-            text(safe_sql),
-            execution_options={"timeout": 10},
-        )
-        columns = list(result.keys())
-        rows = [dict(zip(columns, row)) for row in result.fetchall()]
+    def _run() -> tuple[list[str], list[dict[str, Any]]]:
+        with engine.connect() as conn:
+            result = conn.execute(text(safe_sql))
+            columns = list(result.keys())
+            rows = [dict(zip(columns, row)) for row in result.fetchall()]
+            return columns, rows
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_run)
+        try:
+            columns, rows = future.result(timeout=_QUERY_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # 强制取消 (ThreadPoolExecutor 子线程仍持有, GC 时回收).
+            # pymysql 在 result 取消时, 下次网络读会抛 OperationalError; 下次
+            # connect 时 pool_pre_ping 会发 SELECT 1 探活, 失败就重连.
+            return (
+                f"[查询超时] 超过 {_QUERY_TIMEOUT_SEC}s 已中止 "
+                f"(用更窄的 WHERE / 加索引 / 拆 subquery)",
+                [],
+            )
 
     # 格式化: markdown 表格
     text_md = _format_as_markdown(columns, rows)
