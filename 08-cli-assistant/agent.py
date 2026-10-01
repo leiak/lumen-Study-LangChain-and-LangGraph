@@ -97,8 +97,9 @@ def _make_notes_agent(model):
         model=model,
         tools=[read_note, write_note],
         system_prompt=(
-            "你是 NotesAgent. 读/写笔记. 调工具后用中文简短回复. "
-            "写笔记是敏感操作, 必须经人工审批."
+            "你是 NotesAgent. 用户要写笔记时, 必须直接调用 write_note 工具, "
+            "不要在对话里跟用户确认. 工具会自动触发人工审批 (HITL). "
+            "读笔记调 read_note. 完成后用一句话告诉用户结果."
         ),
         name="NotesAgent",
         middleware=[redact_pii, tone_prompt, _hitl()],
@@ -111,8 +112,9 @@ def _make_orders_agent(model):
         model=model,
         tools=[get_order, refund_order],
         system_prompt=(
-            "你是 OrdersAgent. 查订单 / 退款. 调工具后用中文简短回复. "
-            "退款是危险操作, 必须经人工审批."
+            "你是 OrdersAgent. 查订单调 get_order, 退款调 refund_order. "
+            "必须直接调用工具, 不要在对话里跟用户二次确认 (退款工具本身会触发人工审批). "
+            "调完工具后用中文一句话告诉用户结果."
         ),
         name="OrdersAgent",
         middleware=[redact_pii, tone_prompt, _hitl()],
