@@ -31,6 +31,15 @@ _ORDERS: dict[str, dict] = {
 }
 
 
+def _norm_order_id(order_id: str) -> str:
+    """订单号兼容: '123' / '#123' 都规范化成 '#123'.
+
+    LLM 经常把 '#123' 解析成 '123' (丢了 #), 让 demo 用起来更友好.
+    """
+    s = order_id.strip()
+    return s if s.startswith("#") else f"#{s}"
+
+
 # ============================================================
 # Weather — 无 HITL
 # ============================================================
@@ -138,11 +147,12 @@ def write_note(name: str, content: str) -> str:
 # ============================================================
 @tool
 def get_order(order_id: str) -> str:
-    """(mock) 查订单详情."""
-    info = _ORDERS.get(order_id)
+    """(mock) 查订单详情. 订单号 '123' / '#123' 都接受."""
+    oid = _norm_order_id(order_id)
+    info = _ORDERS.get(oid)
     if info is None:
-        return f"订单 {order_id} 不存在"
-    return f"订单 {order_id}: {info['item']}, 金额 {info['amount']} 元, 状态 {info['status']}"
+        return f"订单 {order_id} 不存在 (demo 内置 #123 / #456)"
+    return f"订单 {oid}: {info['item']}, 金额 {info['amount']} 元, 状态 {info['status']}"
 
 
 @tool
@@ -150,7 +160,8 @@ def refund_order(order_id: str, amount: float) -> str:
     """(mock) 给订单退款. ⚠️ 触发 HITL 审批. 金额 > 10000 业务拒绝."""
     if amount > 10000:
         return f"退款失败: 金额 {amount} 超过业务上限 10000"
-    info = _ORDERS.get(order_id)
+    oid = _norm_order_id(order_id)
+    info = _ORDERS.get(oid)
     if info is None:
-        return f"订单 {order_id} 不存在"
-    return f"订单 {order_id} 已退款 {amount} 元 (原金额 {info['amount']} 元)"
+        return f"订单 {order_id} 不存在 (demo 内置 #123 / #456)"
+    return f"订单 {oid} 已退款 {amount} 元 (原金额 {info['amount']} 元)"

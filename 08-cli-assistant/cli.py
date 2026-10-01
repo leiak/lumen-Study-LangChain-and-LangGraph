@@ -30,6 +30,12 @@ from langgraph.types import Command
 
 from memory import get_prefs, set_pref
 
+# Supervisor 内部 routing 消息 (langgraph_supervisor 内部 AIMessage, 不该显示给用户)
+_SUPERVISOR_NOISE = (
+    "Transferring back to supervisor",
+    "Successfully transferred back to supervisor",
+)
+
 
 # ============================================================
 # 欢迎语 + 帮助
@@ -245,13 +251,24 @@ class CLI:
     async def _stream_and_print(self, input_data: dict, config: dict) -> None:
         """统一处理 astream + token 打印 + 错误捕获.
 
-        astream(stream_mode="messages") 永远 yield (BaseMessage, metadata) 二元组,
-        token 一定有 .content; 空 content 字符串自然跳过 (truthy check).
+        ⚠️ 过滤两类 noise:
+        1. ToolMessage — 工具结果, 是数据不是给用户的文本 (LLM 会再复述一遍,
+           提前打印会让用户看两遍同一信息)
+        2. langgraph_supervisor 内部 routing AIMessage ("Transferring back
+           to supervisor" / "Successfully transferred back to supervisor")
+           是 framework 内部 chatter, 跟用户问题无关
         """
         try:
             async for token, _ in self.graph.astream(
                 input_data, config=config, stream_mode="messages"
             ):
+                # 跳过 ToolMessage (工具结果)
+                if type(token).__name__ == "ToolMessage":
+                    continue
+                # 跳过 supervisor 内部 routing chatter
+                if isinstance(token.content, str):
+                    if any(token.content.startswith(prefix) for prefix in _SUPERVISOR_NOISE):
+                        continue
                 if token.content:
                     print(token.content, end="", flush=True)
             print()
