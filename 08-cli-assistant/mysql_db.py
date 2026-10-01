@@ -145,6 +145,22 @@ _HASH_COMMENT_RE = re.compile(r"#[^\n]*")    # # 到行尾 (MySQL 特有)
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)  # /* ... */
 _DEFAULT_LIMIT = 1000
 _LIMIT_RE = re.compile(r"\bLIMIT\s+\d+", re.IGNORECASE)
+# 危险 verb 集合 — 只要 SQL 里任何位置 (作为 keyword token) 出现, 都拒绝.
+# 关键: sqlparse.Statement.get_type() 只看首词, 所以
+# "WITH cte AS (...) INSERT INTO ..." 这种语句会被识别成 WITH 而绕过.
+# 我们必须遍历所有顶级 Keyword token 才能堵住这个洞.
+_FORBIDDEN_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE",
+    "TRUNCATE", "DROP", "ALTER", "CREATE", "RENAME",
+    "GRANT", "REVOKE", "SET", "CALL", "LOAD", "HANDLER", "LOCK",
+    "OPTIMIZE", "ANALYZE", "REPAIR", "CHECK", "BACKUP", "RESTORE",
+}
+# 词边界正则双保险 — 即便 token 切分漏掉, raw 字符串也拒.
+_DDL_REGEX = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE|DROP|ALTER|CREATE|RENAME|"
+    r"GRANT|REVOKE|SET|CALL|LOAD|HANDLER|LOCK)\b",
+    re.IGNORECASE,
+)
 
 
 def _first_keyword(stmt) -> str:
@@ -197,6 +213,10 @@ def _audit_sql(sql: str) -> str:
       5. SELECT/WITH 语句如果没 LIMIT, 自动追加 LIMIT 1000 (防 OOM)
       6. SELECT * 警告 (但不阻断 — LLM 有时确实需要 *)
 
+    ⚠️ C1 关键防御: 即使 statement.get_type() 返回 'WITH' (合法),
+    我们仍然遍历所有顶级 Keyword token, 一旦发现 INSERT/UPDATE/DELETE 等
+    危险 verb, 就拒. 这堵住了 "WITH cte AS (...) INSERT INTO ..." 的绕过攻击.
+
     注意: 单纯关键词黑名单不是绝对安全, 但对 demo 级别够用.
     生产应:
       - 用只读 DB user (GRANT SELECT)
@@ -226,6 +246,27 @@ def _audit_sql(sql: str) -> str:
     stmt = non_empty[0] if non_empty else None
     if stmt is None:
         raise ValueError("无法解析 SQL")
+
+    # C1: 遍历所有顶级 Keyword token, 发现任何危险 verb 即拒.
+    # 这堵住 "WITH cte AS (...) INSERT/UPDATE/DELETE ..." 的绕过 (sqlparse 的
+    # get_type() 只看首词, 会把这类语句识别成 WITH 而放过).
+    # ⚠️ sqlparse 的 _TokenType 是带前缀匹配的 tuple subclass. `__contains__` 的
+    # 语义是"item 是否以 self 为前缀" — 所以检测"X 是 Keyword 的子类"要用
+    # `ttype in Token.Keyword` (X in 父). Token.Keyword.DML / .DDL / .CTE 都满足.
+    for tok in stmt.tokens:
+        ttype = tok.ttype
+        if ttype is not None and ttype in sqlparse.tokens.Keyword:
+            val = str(tok).strip().upper()
+            if val in _FORBIDDEN_KEYWORDS:
+                raise ValueError(
+                    f"检测到危险 verb {val!r} (statement 内任何位置都禁止), 已拒绝"
+                )
+    # 双保险: 词边界 regex 再 grep 一次 (防 sqlparse token 切分漏掉)
+    m = _DDL_REGEX.search(cleaned)
+    if m:
+        raise ValueError(
+            f"检测到危险 verb {m.group(0).upper()!r} (regex 双检), 已拒绝"
+        )
 
     # statement 类型检查
     # ⚠️ sqlparse 的 get_type() 对 SHOW / DESCRIBE / EXPLAIN 返回 'UNKNOWN',
