@@ -5,11 +5,13 @@
   calc       : calc  (AST 安全求值,禁止 __import__)
   notes      : read_note, write_note  (write_note 触发 HITL)
   orders     : get_order, refund_order (refund_order 触发 HITL)
+  mysql      : list_tables, describe_table, run_sql (run_sql 触发 HITL)
 
 安全:
   - calc 用 ast.parse + 白名单节点,禁止 Name/Call/Attribute (避免 __import__/open)
   - read_note/write_note 的 name 限制 [a-z0-9_]+,防路径穿越
   - refund_order 金额 > 10000 拒绝 (业务规则)
+  - run_sql 用 sqlparse + 白名单 statement type (SELECT/SHOW/...) + 自动 LIMIT 1000
 """
 from __future__ import annotations
 
@@ -165,3 +167,76 @@ def refund_order(order_id: str, amount: float) -> str:
     if info is None:
         return f"订单 {order_id} 不存在 (demo 内置 #123 / #456)"
     return f"订单 {oid} 已退款 {amount} 元 (原金额 {info['amount']} 元)"
+
+
+# ============================================================
+# MySQL — run_sql 触发 HITL
+# ============================================================
+# Lazy import: mysql_db 在 .env 没配 MySQL 时也能 import (build_engine 才连 DB).
+# 这样 6 个 mock 工具和其它 specialist 不受 MySQL env 影响, 单独 run_sql 调时才报错.
+from mysql_db import build_engine, get_schema_summary, execute_safe_select
+
+
+@tool
+def list_tables() -> str:
+    """(mysql) 列出数据库所有表名 + 行数估算. 第一次问数时先调这个看有哪些表.
+
+    返回格式: '数据库表:\n  - users\n  - orders\n  - order_items'
+    """
+    try:
+        engine = build_engine()
+    except RuntimeError as e:
+        return f"(MySQL 未配置: {e})"
+    tables, _ = get_schema_summary(engine)
+    if not tables:
+        return "(数据库没有表, 或者连接失败 — 检查 .env)"
+    return "数据库表:\n" + "\n".join(f"  - {t}" for t in tables)
+
+
+@tool
+def describe_table(table_name: str) -> str:
+    """(mysql) describe 表结构: 列名 + 类型 + 注释. 写 SQL 前先 describe 一下看字段.
+
+    table_name 不带引号 (e.g. 'users', 不是 '`users`').
+    返回格式: 'users 表结构:\\n  id: int NOT NULL PRI ...'
+    """
+    try:
+        engine = build_engine()
+        _, describe = get_schema_summary(engine)
+    except RuntimeError as e:
+        return f"(MySQL 未配置: {e})"
+    if table_name not in describe:
+        available = list(describe.keys())
+        return f"表 {table_name!r} 不存在. 可用表: {available}"
+    return describe[table_name]
+
+
+@tool
+def run_sql(query: str) -> str:
+    """(mysql) 执行 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH 查询, 返回格式化 markdown 表格.
+
+    ⚠️ 触发 HITL 审批 — execute 前会先弹窗让用户确认.
+
+    安全审计 (mysql_db._audit_sql):
+      - 只允许 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH (statement type 白名单)
+      - 拒绝 INSERT/UPDATE/DELETE/DROP/TRUNCATE/GRANT 等写操作
+      - 拒绝多语句 (; 后面有内容)
+      - 拒绝 INTO OUTFILE / LOAD DATA / LOAD_FILE / INFORMATION_SCHEMA
+      - 拒绝注释注入 (-- / # / /* */) — 先 strip 再审计
+      - 自动 LIMIT 1000 (防 OOM)
+      - 10s 查询超时 (execution_options)
+
+    返回: markdown 表格 (前 50 行 + 行数统计) 或 [安全审计拒绝] 错误.
+    """
+    try:
+        engine = build_engine()
+        result_text, _ = execute_safe_select(engine, query)
+    except RuntimeError as e:
+        return f"(MySQL 未配置: {e})"
+    except ValueError as e:
+        # _audit_sql 拒绝: 转成 ToolMessage 给 LLM 看 (LLM 会改 SQL 重试)
+        return f"[安全审计拒绝] {e}"
+    except Exception as e:
+        # SQL 语法错 / 表不存在 / 连接断: 透传给 LLM
+        return f"[SQL 执行失败] {type(e).__name__}: {e}"
+    return result_text
