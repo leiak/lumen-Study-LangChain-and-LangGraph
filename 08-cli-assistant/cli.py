@@ -45,13 +45,14 @@ WELCOME = """
 │  智能个人助手 CLI  (08-cli-assistant)       │
 │                                             │
 │  输入问题 → streaming token 流式输出        │
-│  危险操作 (退款/写笔记) → 自动暂停审批      │
+│  危险操作 (退款/写笔记/SQL) → 自动暂停审批  │
 │                                             │
 │  内置命令:                                  │
 │    /history   列出 checkpoints               │
 │    /rewind N  回到第 N 个 checkpoint         │
 │    /fork TXT  改历史后在新 thread 续走      │
 │    /memory    查看/编辑长期偏好              │
+│    /mysql     探测 MySQL 连接 + 列表         │
 │    /help      帮助                           │
 │    /quit, /exit  退出                        │
 ╰─────────────────────────────────────────────╯
@@ -65,6 +66,7 @@ HELP_TEXT = """
   /fork <text>       在最新 checkpoint 上追加 <text>, 新 thread 续走
   /memory            查看偏好
   /memory <key> <v>  设置偏好 (nickname / city / language / user_*)
+  /mysql             探测 MySQL 连接 + 列出所有表 (含列结构)
   /help              本帮助
   /quit, /exit       退出
 
@@ -74,6 +76,7 @@ HELP_TEXT = """
   - "查订单 #123"    → 派 OrdersAgent
   - "退款 #123 100"  → OrdersAgent 触发 HITL (输入 a/r 决策)
   - "写笔记 todo ..." → NotesAgent 触发 HITL
+  - "北京有几个用户"  → DataAgent (调 list_tables → describe_table → run_sql 触发 HITL)
 """
 
 
@@ -194,6 +197,10 @@ class CLI:
                 print("用法: /memory [key value]")
             return False
 
+        if cmd == "/mysql":
+            self._cmd_mysql()
+            return False
+
         print(f"未知命令: {cmd}. 输入 /help 查看.")
         return False
 
@@ -285,6 +292,37 @@ class CLI:
         for k, v in prefs.items():
             print(f"  {k}: {v}")
         print(f"  (namespace: {self.store_ns})")
+
+    def _cmd_mysql(self) -> None:
+        """探测 MySQL 连接 + 列出表结构 (绕过 LLM, 调试用).
+
+        不走 DataAgent / LLM, 直接调 mysql_db 给运维视角的快照:
+          - 失败 → 友好提示怎么修
+          - 成功 → 列出表 + 每张表的列结构
+        """
+        try:
+            from mysql_db import build_engine, get_schema_summary
+            engine = build_engine()
+            tables, describe = get_schema_summary(engine)
+        except RuntimeError as e:
+            print(f"\n[error] MySQL 未配置: {e}")
+            print("  在 .env 设置 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / "
+                  "MYSQL_PASSWORD / MYSQL_DATABASE")
+            return
+        except Exception as e:
+            print(f"\n[error] MySQL 连接失败: {type(e).__name__}: {e}")
+            return
+
+        if not tables:
+            print("\n>>> MySQL 连接成功, 但没有表")
+            return
+
+        print(f"\n>>> MySQL 连接成功, 共有 {len(tables)} 张表:")
+        for t in tables:
+            print(f"\n  [{t}]")
+            # describe dict 里 value 是多行字符串, 缩进再加一层
+            for line in describe.get(t, "").splitlines():
+                print(f"    {line}")
 
     def _cmd_memory_set(self, key: str, value: str) -> None:
         try:
