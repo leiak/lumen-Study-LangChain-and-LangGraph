@@ -13,6 +13,8 @@ import asyncio
 import os
 import sys
 
+from sqlalchemy import text
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -57,6 +59,19 @@ def main() -> int:
 
     checkpointer = InMemorySaver()
     store, namespace = build_store()
+
+    # 2.5 MySQL 连接探测 (可选 — 没配置也不阻塞 CLI, DataAgent 会优雅提示)
+    # 复用 mysql_db.build_engine (RuntimeError = env 缺失; sqlalchemy.exc.* = 网络/auth 错)
+    try:
+        from mysql_db import build_engine
+        engine = build_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1")).fetchone()
+        print(">>> MySQL: connected")
+    except RuntimeError as e:
+        print(f">>> MySQL: 未配置 ({e}); DataAgent 将无法使用")
+    except Exception as e:
+        print(f">>> MySQL: 连接失败 ({type(e).__name__}: {e}); DataAgent 将无法使用")
 
     try:
         graph = build_graph(llm, checkpointer=checkpointer, store=store)
