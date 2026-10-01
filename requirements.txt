@@ -36,5 +36,10 @@ python-dotenv>=1.0
 httpx>=0.27
 rich>=13.0                       # 漂亮的终端输出
 
+# MySQL (08-cli-assistant DataAgent 用 — LLM 生成 SQL, 我们执行 + 安全审计)
+sqlalchemy>=2.0
+pymysql>=1.1                     # pure-python MySQL driver, 不用编译
+sqlparse>=0.4                    # SQL 解析 + 安全审计 (白名单 statement type)
+
 # 可选: 离线评估
 # deepeval>=2.0
