@@ -1,4 +1,4 @@
-"""agent.py — 装配 supervisor + 4 specialists.
+"""agent.py — 装配 supervisor + 5 specialists.
 
 架构:
   supervisor (create_supervisor)
@@ -6,16 +6,18 @@
     ├── CalcAgent     (create_agent, tools=[calc],          middleware=[redact_pii, tone_prompt])
     ├── NotesAgent    (create_agent, tools=[read_note, write_note],
     │                                       middleware=[redact_pii, tone_prompt, hitl])
-    └── OrdersAgent   (create_agent, tools=[get_order, refund_order],
-                                          middleware=[redact_pii, tone_prompt, hitl])
+    ├── OrdersAgent   (create_agent, tools=[get_order, refund_order],
+    │                                       middleware=[redact_pii, tone_prompt, hitl])
+    └── DataAgent     (create_agent, tools=[list_tables, describe_table, run_sql],
+                                       middleware=[redact_pii, tone_prompt, hitl])
 
 重要坑 (spec review R3, fix commit):
   - `supervisor.compile()` 是 `StateGraph.compile()`, 不接受 `middleware=`
     kwarg — middleware 是 langchain.agents.create_agent 的特性, 不是
     langgraph StateGraph 的特性.
-  - 解法: middleware 全部下沉到 4 个 specialist 的 `create_agent(middleware=[...])`.
+  - 解法: middleware 全部下沉到 5 个 specialist 的 `create_agent(middleware=[...])`.
     装饰器 marker 自带去重, LLM 只看到最终状态.
-  - hitl 只挂 NotesAgent + OrdersAgent (其它 specialist 没有危险工具,
+  - hitl 只挂 NotesAgent + OrdersAgent + DataAgent (其它 specialist 没有危险工具,
     HumanInTheLoopMiddleware 挂上去不触发 = 浪费节点).
 
 复用:
@@ -32,21 +34,27 @@ from langgraph_supervisor import create_supervisor
 from middleware import redact_pii, tone_prompt
 from tools import (
     calc,
+    describe_table,
     get_order,
     get_weather,
+    list_tables,
     read_note,
     refund_order,
+    run_sql,
     write_note,
 )
 
 # ============================================================
 # HITL 配置 — 在有危险工具的 specialist 上挂
 # ============================================================
-# write_note / refund_order 都登记上, 触发时整个 subgraph 暂停等待
+# write_note / refund_order / run_sql 都登记上, 触发时整个 subgraph 暂停等待
 # 人工审批 (cli.py 用 Command(resume=...) 恢复).
+# run_sql 触发 HITL: 即使有 _audit_sql 白名单, 也让用户看实际 SQL 再 approve,
+# 这是"双保险" — LLM 生成 SQL 的可解释性.
 _HITL_INTERRUPT_ON = {
     "write_note": {"allowed_decisions": ["approve", "edit", "reject"]},
     "refund_order": {"allowed_decisions": ["approve", "edit", "reject"]},
+    "run_sql": {"allowed_decisions": ["approve", "edit", "reject"]},
 }
 
 
@@ -121,6 +129,26 @@ def _make_orders_agent(model):
     )
 
 
+def _make_data_agent(model):
+    # run_sql 是危险工具 → HITL
+    return create_agent(
+        model=model,
+        tools=[list_tables, describe_table, run_sql],
+        system_prompt=(
+            "你是 DataAgent. 用户问业务数据 (订单/用户/销售/统计等), 用 MySQL 工具.\n"
+            "策略:\n"
+            "  1. 第一次问: 先 list_tables 看有哪些表, 再 describe_table 查表结构\n"
+            "  2. 写 SQL: 只用 SELECT/SHOW, 不要 SELECT * (列名写全), 必须加 LIMIT\n"
+            "  3. 复杂查询分步走, 中间结果用 subquery\n"
+            "  4. 查询超 1000 行: 加 WHERE/LIMIT/GROUP BY 缩小范围\n"
+            "run_sql 工具会自动触发人工审批 (HITL) — 直接调用, 不要在对话里确认. "
+            "调完工具后用中文一句话 + 关键数字告诉用户."
+        ),
+        name="DataAgent",
+        middleware=[redact_pii, tone_prompt, _hitl()],
+    )
+
+
 # ============================================================
 # Supervisor 装配
 # ============================================================
@@ -129,6 +157,7 @@ SUPERVISOR_PROMPT = """你是智能个人助手 supervisor. 根据用户问题, 
   - CalcAgent:    数学计算
   - NotesAgent:   笔记读写
   - OrdersAgent:  订单/退款
+  - DataAgent:    MySQL 业务数据查询 (订单/用户/销售统计等)
 
 不要直接调工具. 一次只派一个 specialist. 用中文回复用户."""
 
@@ -143,16 +172,17 @@ def build_graph(model, *, checkpointer=None, store=None):
         kwarg (那是 langchain.agents.create_agent 的特性).
       - 所以 redact_pii / tone_prompt / hitl 都下沉到各 specialist 的
         create_agent(middleware=[...]) 里.
-      - hitl 只在 NotesAgent / OrdersAgent 上挂 (其它 specialist 没有
-        危险工具, HITL 不会触发).
+      - hitl 只在 NotesAgent / OrdersAgent / DataAgent 上挂 (其它 specialist
+        没有危险工具, HITL 不会触发).
     """
     weather_agent = _make_weather_agent(model)
     calc_agent = _make_calc_agent(model)
     notes_agent = _make_notes_agent(model)
     orders_agent = _make_orders_agent(model)
+    data_agent = _make_data_agent(model)
 
     supervisor = create_supervisor(
-        agents=[weather_agent, calc_agent, notes_agent, orders_agent],
+        agents=[weather_agent, calc_agent, notes_agent, orders_agent, data_agent],
         model=model,
         prompt=SUPERVISOR_PROMPT,
         output_mode="last_message",  # 只回最后一个 specialist 的 final message (supervisor 内部 routing 不进 messages)
