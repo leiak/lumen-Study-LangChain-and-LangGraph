@@ -1,10 +1,10 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 6 tools OK · memory prefs OK · async command routing OK · PII redaction OK (phone + ID + mixed 不互相 mangled) · AST parse 7/7 OK
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (phone + ID + mixed 不互相 mangled) · AST parse 8/7 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
-脱敏 + 动态语气 + long-term Store + time-travel rewind / fork。
+脱敏 + 动态语气 + long-term Store + time-travel rewind / fork + MySQL 智能问数。
 
 不是新概念 — 是把前面 7 个 demo 揉进一个 REPL。
 
@@ -43,6 +43,71 @@ python main.py
 > ⚠️ Shell 全局 `export ANTHROPIC_API_KEY=xxx` 会让 `.env` 改动失效。
 > 临时绕过: `env -u ANTHROPIC_API_KEY python main.py`。
 
+## MySQL 智能问数 (DataAgent, 第 5 个 specialist)
+
+LLM 生成 SQL → 安全审计 → HITL 审批 → 执行 → markdown 表格回显。
+中间任何一步出错都不会阻塞其它 4 个 specialist (没配 MySQL 完全 OK)。
+
+### 设置
+
+```bash
+# 1. .env 加 5 个 MySQL env vars
+cat .env
+#   MYSQL_HOST=localhost
+#   MYSQL_PORT=3306
+#   MYSQL_USER=root
+#   MYSQL_PASSWORD=xxx
+#   MYSQL_DATABASE=cli_demo
+
+# 2. 加载参考 schema (5 用户 / 6 订单 / 6 明细)
+mysql -u root -p < 08-cli-assistant/schema.sql
+
+# 3. (可选) 探测连接 + 列表
+python main.py
+#   >>> MySQL: connected
+#   你> /mysql
+#   >>> MySQL 连接成功, 共有 3 张表:
+#     [users] ...
+#     [orders] ...
+#     [order_items] ...
+```
+
+### 安全审计 (`mysql_db._audit_sql`)
+
+LLM 生成的 SQL 在执行前过 4 道关:
+
+1. **statement type 白名单** — 只允许 `SELECT / SHOW / DESCRIBE / EXPLAIN / WITH`,
+   其它 (INSERT/UPDATE/DELETE/DROP/TRUNCATE/GRANT) → ValueError
+3. **黑名单子串** — `INTO OUTFILE / INTO DUMPFILE / LOAD DATA / LOAD_FILE /
+   INFORMATION_SCHEMA / MYSQL. / PERFORMANCE_SCHEMA` → ValueError
+4. **多语句拦截** — sqlparse 解析后 > 1 个 statement → ValueError
+5. **注释先剥离再审计** — `--` / `#` / `/* */` 用正则抹掉 (sqlparse 不一定识别
+   `--` 为 Comment token), 防 `SELECT 1 -- ; DROP TABLE` 注入
+
+附加:
+
+- **自动 LIMIT 1000** — SELECT/WITH 没 LIMIT 时自动追加 (用 `_LIMIT_RE` 检测,
+  不是简单 substring; 防 `LIMIT 1000000` 之类)
+- **10s 超时** — SQLAlchemy `execution_options={"timeout": 10}`
+- **markdown 输出** — 表格前 50 行 + 总行数; 列宽 30 字符截断
+
+### HITL 触发
+
+`run_sql` 也挂 HITL — 即使审计通过, 也让用户在终端看到实际 SQL 再 approve。
+UX 跟 `refund_order` / `write_note` 一致: `[a]pprove` / `[r]eject` (cli.py `_maybe_hitl`)。
+
+### 已知坑
+
+- **`create_supervisor` 要求 sub-agent 有 `name=`** — 没名字路由不了 (每个
+  `create_agent` 必须 `name="DataAgent"` 等)。
+- **Pylance type-check warnings on middleware 是 noise, 实际不报错** — VS Code
+  Pylance 在 `_hitl()` 调用处报 `Expected type '_AgentMiddleware[StateT]'`,
+  实际运行时 middleware 正常工作。这是 LangChain 1.x middleware 装饰器对
+  Generic StateT 的 hint 不全, 不是 bug。
+- **MySQL 没装 / .env 没配 → 启动不阻塞** — `main.py` 用 try/except 包住
+  `build_engine()`, 失败时打印 `>>> MySQL: 未配置 (...)`. 其它 4 个 specialist
+  仍能用。
+
 ## 7 个手测场景
 
 | # | 输入 | 期望 |
@@ -54,6 +119,9 @@ python main.py
 | 5 | `我的手机号 13800138000` | PII middleware 脱敏成 `1XX-XXXX-XXXX` (LLM 看不到原号) |
 | 6 | 跑 3 轮对话 → `/history` → `/rewind 1` | 状态回到第 1 轮, 下一次输入从该 checkpoint 续走 (一次性 rewind) |
 | 7 | `/memory nickname fang` → `/quit` → 重启 → `/memory` | nickname 默认值 (注: `InMemoryStore` 重启就丢) |
+| 8 | `/mysql` (需先 `mysql < schema.sql`) | 列出 users / orders / order_items 三表 + 列结构 |
+| 9 | `北京有几个用户` (DataAgent) | 调 `list_tables` → `describe_table users` → `run_sql SELECT COUNT(*) ... WHERE city='北京'`, 触发 HITL 输入 `a` 通过, 返回 `1` |
+| 10 | `哪个商品卖得最好` (DataAgent 复杂查询) | 调 `list_tables` → `describe_table order_items` → `run_sql SELECT product, SUM(quantity)... GROUP BY product ORDER BY SUM(quantity) DESC LIMIT 1`, HITL 通过 |
 
 ### HITL 决策细节
 
@@ -95,6 +163,7 @@ base, 末尾追加语气行。
 | `/fork <text>` | 在最新 checkpoint 上追加 text, 用 `update_state` 创建新 thread 续走 |
 | `/memory` | 查看长期偏好 (`InMemoryStore` namespace) |
 | `/memory <key> <v>` | 设置偏好 (内置: `nickname`/`city`/`language`; 自定义: 必须 `user_xxx` 前缀) |
+| `/mysql` | 探测 MySQL 连接 + 列出表结构 (运维视角, 绕过 LLM) |
 | `/quit`, `/exit` | 退出 REPL |
 
 > ⚠️ `/fork` 后 `active_thread_id` 切换到新 thread — 后续 `/history` 和 `run_turn`
@@ -114,15 +183,15 @@ cli.REPL.read()
    └─ 普通文本 → supervisor graph (astream stream_mode="messages")
                      ↓
                    [每个 specialist 内的 middleware]
-                   middleware: redact_pii (@wrap_model_call, 4 个 specialist 都有)
-                   middleware: tone_prompt (@dynamic_prompt, 4 个 specialist 都有)
+                   middleware: redact_pii (@wrap_model_call, 5 个 specialist 都有)
+                   middleware: tone_prompt (@dynamic_prompt, 5 个 specialist 都有)
                      ↓
                    supervisor node → Command 路由
                      ↓
-                   specialist × 4 (weather/calc/notes/orders)
+                   specialist × 5 (weather/calc/notes/orders/data)
                      ↓
                    工具调用 → HumanInTheLoopMiddleware 检查
-                     ├─ 危险工具 (refund_order / write_note)
+                     ├─ 危险工具 (refund_order / write_note / run_sql)
                      │     → interrupt() 暂停, stdin 决策 a/r
                      └─ 普通工具 → 直接执行
                      ↓
@@ -137,6 +206,7 @@ cli.REPL.read()
 | `CalcAgent` | `calc` (AST 安全) | — | redact_pii, tone_prompt |
 | `NotesAgent` | `read_note`, `write_note` | write_note | redact_pii, tone_prompt, hitl |
 | `OrdersAgent` | `get_order`, `refund_order` | refund_order | redact_pii, tone_prompt, hitl |
+| `DataAgent` | `list_tables`, `describe_table`, `run_sql` | run_sql | redact_pii, tone_prompt, hitl |
 
 HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl` 不触发 = 浪费节点。
 
@@ -145,12 +215,14 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 ```
 08-cli-assistant/
 ├── _common.py     # 复用 01-langchain-basics/_common.py (via importlib shim)
-├── tools.py       # 6 个 mock 工具 (weather/calc/notes/orders)
+├── tools.py       # 9 个工具 (weather/calc/notes/orders/mysql)
 ├── middleware.py  # PII 脱敏 + 动态语气
 ├── memory.py      # Store 包装 + 偏好读写
-├── agent.py       # supervisor + 4 specialists + HITL
+├── agent.py       # supervisor + 5 specialists + HITL
+├── mysql_db.py    # MySQL 连接 + schema 查询 + 安全审计 (_audit_sql)
+├── schema.sql     # 参考 schema (3 表, 用户手动 mysql < schema.sql)
 ├── cli.py         # REPL + 命令 + 流式 + HITL 审批
-├── main.py        # 入口 + API key 检查
+├── main.py        # 入口 + API key 检查 + MySQL 探测
 └── README.md      # 本文件
 ```
 
@@ -159,12 +231,13 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 | 文件 | 关键点 |
 |---|---|
 | `_common.py` | 用 `importlib.util.spec_from_file_location` 按路径加载 L1 的 `_common.py`, 不复制不污染 `sys.path` |
-| `tools.py` | `calc` 用 `ast.parse` + 白名单节点 (`Constant/BinOp/UnaryOp`) + 1s ThreadPoolExecutor timeout + `_MAX_EXP=10000` 防 `9**9**9` DoS; `write_note` name 限 `[a-z0-9_]{1,32}` 防路径穿越; `refund_order` 金额 > 10000 业务拒绝 |
+| `tools.py` | `calc` 用 `ast.parse` + 白名单节点 (`Constant/BinOp/UnaryOp`) + 1s ThreadPoolExecutor timeout + `_MAX_EXP=10000` 防 `9**9**9` DoS; `write_note` name 限 `[a-z0-9_]{1,32}` 防路径穿越; `refund_order` 金额 > 10000 业务拒绝; `run_sql` 调 `mysql_db.execute_safe_select` (audit + execute + 格式化) |
 | `middleware.py` | PII 正则 `\d{17}[\dXx]\|1[3-9]\d{9}` (ID 在前, 顺序敏感); `redact_pii` 用 `model_copy(update={...})` 不污染原 state; `tone_prompt` 以 `request.system_prompt` 为 base 追加 |
 | `memory.py` | namespace `("user_prefs", user_id)` (`user_id` 来自 env `CLI_USER_ID`, 默认 `"default"`); 默认 prefs: `nickname=friend`, `city=上海`, `language=中文` |
-| `agent.py` | `supervisor.compile()` 不接受 `middleware=` — middleware 全部下沉到 `create_agent(middleware=[...])`; `output_mode="last_message"` 让 supervisor 内部 routing 不进 messages |
-| `cli.py` | `astream(stream_mode="messages")` token 流; HITL 检查 `state.next` + `state.tasks[0].interrupts[0].value`; rewind 一次性, `run_turn` 完成后清 `_rewind_ckpt`; `_stream_and_print` 异常捕获 |
-| `main.py` | API key 4-provider 检测 → `InMemorySaver` + `build_store()` → `asyncio.run(cli.run())` |
+| `mysql_db.py` | `_audit_sql` 用 sqlparse 拆 statement + 白名单 type (SELECT/SHOW/...) + 正则 strip 注释 + 自动 LIMIT 1000 + 10s `execution_options` timeout; `get_schema_summary` 用 `SHOW FULL COLUMNS` 拿注释 |
+| `agent.py` | `supervisor.compile()` 不接受 `middleware=` — middleware 全部下沉到 `create_agent(middleware=[...])`; `output_mode="last_message"` 让 supervisor 内部 routing 不进 messages; DataAgent system_prompt 强制 tool 调用 (不二次确认) |
+| `cli.py` | `astream(stream_mode="messages")` token 流; HITL 检查 `state.next` + `state.tasks[0].interrupts[0].value`; rewind 一次性, `run_turn` 完成后清 `_rewind_ckpt`; `_stream_and_print` 异常捕获; `/mysql` 命令绕过 LLM 直连 |
+| `main.py` | API key 4-provider 检测 → MySQL 探测 (失败不阻塞) → `InMemorySaver` + `build_store()` → `asyncio.run(cli.run())` |
 
 ## 4 个高级特性对应实现
 
@@ -172,7 +245,7 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 |---|---|---|
 | Streaming | `cli.py` `_stream_and_print` 用 `astream(stream_mode="messages")` | `02-langgraph-orchestration/09_streaming.py` demo 3 |
 | HITL | `agent.py` 每个 specialist 挂 `HumanInTheLoopMiddleware`; `cli.py` `_maybe_hitl` 处理 interrupt | `01-langchain-basics/04_middleware.py` demo 5 |
-| Supervisor | `agent.py` 用 `langgraph_supervisor.create_supervisor` 派 4 specialists | `04-multi-agent/13_supervisor.py` |
+| Supervisor | `agent.py` 用 `langgraph_supervisor.create_supervisor` 派 5 specialists | `04-multi-agent/13_supervisor.py` |
 | Time travel | `cli.py` `_cmd_history` / `_cmd_rewind` / `_cmd_fork` 用 `get_state_history` + `update_state` + `checkpoint_id` 注入 | `02-langgraph-orchestration/10_durable_execution.py` |
 | PII Middleware | `middleware.py` `redact_pii` (`@wrap_model_call`) | `01-langchain-basics/04_middleware.py` demo 8 |
 | Dynamic Prompt | `middleware.py` `tone_prompt` (`@dynamic_prompt`, append 而非 replace) | `01-langchain-basics/04_middleware.py` demo 1 |
