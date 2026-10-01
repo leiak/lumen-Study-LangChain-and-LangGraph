@@ -20,6 +20,7 @@ import concurrent.futures
 import operator
 import re
 from langchain_core.tools import tool
+from sqlalchemy import text
 
 # ============================================================
 # Mock 数据 — 内存 dict,够 demo 用
@@ -179,18 +180,30 @@ from mysql_db import build_engine, get_schema_summary, execute_safe_select
 
 @tool
 def list_tables() -> str:
-    """(mysql) 列出数据库所有表名 + 行数估算. 第一次问数时先调这个看有哪些表.
+    """(mysql) 列出数据库所有表名 + 近似行数 (information_schema.tables.table_rows).
 
-    返回格式: '数据库表:\n  - users\n  - orders\n  - order_items'
+    行数来自 information_schema.tables.table_rows (InnoDB 统计估算, 可能有 ±10% 误差,
+    但 O(1) 快, 不需要 SELECT COUNT(*)). 第一次问数时先调这个看有哪些表.
+
+    返回格式: '数据库表 (近似行数):\n  - users  (~5 行)\n  - orders  (~6 行)'
     """
     try:
         engine = build_engine()
     except RuntimeError as e:
         return f"(MySQL 未配置: {e})"
-    tables, _ = get_schema_summary(engine)
-    if not tables:
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT table_name, table_rows FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() ORDER BY table_name"
+        )).mappings().all()
+    if not rows:
         return "(数据库没有表, 或者连接失败 — 检查 .env)"
-    return "数据库表:\n" + "\n".join(f"  - {t}" for t in tables)
+    lines = ["数据库表 (近似行数):"]
+    for r in rows:
+        n = r["table_rows"]
+        n_disp = f"~{n}" if n is not None else "?"
+        lines.append(f"  - {r['table_name']}  ({n_disp} 行)")
+    return "\n".join(lines)
 
 
 @tool
