@@ -20,7 +20,6 @@ import concurrent.futures
 import operator
 import re
 from langchain_core.tools import tool
-from sqlalchemy import text
 
 # ============================================================
 # Mock 数据 — 内存 dict,够 demo 用
@@ -181,31 +180,23 @@ def refund_order(order_id: str, amount: float) -> str:
 
 @tool
 def list_tables() -> str:
-    """(mysql) 列出数据库所有表名 + 近似行数 (information_schema.tables.table_rows).
+    """(mysql) 列出数据库所有表名.
 
-    行数来自 information_schema.tables.table_rows (InnoDB 统计估算, 可能有 ±10% 误差,
-    但 O(1) 快, 不需要 SELECT COUNT(*)). 第一次问数时先调这个看有哪些表.
+    复用 mysql_db.get_schema_summary (SHOW TABLES + 60s 模块级缓存), 避免直接查
+    information_schema.tables.table_rows — 那个 column 在某些 MySQL 版本 / 配置 /
+    列权限下不返回, 会 NoSuchColumnError. SHOW TABLES 跨版本都稳.
 
-    返回格式: '数据库表 (近似行数):\n  - users  (~5 行)\n  - orders  (~6 行)'
+    返回格式: '数据库表:\n  - users\n  - orders'
     """
-    from mysql_db import build_engine  # 真正 lazy
+    from mysql_db import build_engine, get_schema_summary  # 真正 lazy
     try:
         engine = build_engine()
+        tables, _ = get_schema_summary(engine)
     except RuntimeError as e:
         return f"(MySQL 未配置: {e})"
-    with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT table_name, table_rows FROM information_schema.tables "
-            "WHERE table_schema = DATABASE() ORDER BY table_name"
-        )).mappings().all()
-    if not rows:
+    if not tables:
         return "(数据库没有表, 或者连接失败 — 检查 .env)"
-    lines = ["数据库表 (近似行数):"]
-    for r in rows:
-        n = r["table_rows"]
-        n_disp = f"~{n}" if n is not None else "?"
-        lines.append(f"  - {r['table_name']}  ({n_disp} 行)")
-    return "\n".join(lines)
+    return "数据库表:\n" + "\n".join(f"  - {t}" for t in tables)
 
 
 @tool
