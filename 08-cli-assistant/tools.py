@@ -173,9 +173,10 @@ def refund_order(order_id: str, amount: float) -> str:
 # ============================================================
 # MySQL — run_sql 触发 HITL
 # ============================================================
-# Lazy import: mysql_db 在 .env 没配 MySQL 时也能 import (build_engine 才连 DB).
-# 这样 6 个 mock 工具和其它 specialist 不受 MySQL env 影响, 单独 run_sql 调时才报错.
-from mysql_db import build_engine, get_schema_summary, execute_safe_select
+# I4: 真正 lazy import — mysql_db 在 .env 没配 MySQL 时也能 import tools.py
+# (mysql_db 顶层 import 都 OK, 但 build_engine() 在缺 env 时 raise RuntimeError).
+# 把 from mysql_db import ... 挪进函数, 让 tools.py 即使 mysql_db 有任何
+# import-time 错误也能干净加载.
 
 
 @tool
@@ -187,6 +188,7 @@ def list_tables() -> str:
 
     返回格式: '数据库表 (近似行数):\n  - users  (~5 行)\n  - orders  (~6 行)'
     """
+    from mysql_db import build_engine  # 真正 lazy
     try:
         engine = build_engine()
     except RuntimeError as e:
@@ -213,6 +215,7 @@ def describe_table(table_name: str) -> str:
     table_name 不带引号 (e.g. 'users', 不是 '`users`').
     返回格式: 'users 表结构:\\n  id: int NOT NULL PRI ...'
     """
+    from mysql_db import build_engine, get_schema_summary  # 真正 lazy
     try:
         engine = build_engine()
         _, describe = get_schema_summary(engine)
@@ -232,15 +235,16 @@ def run_sql(query: str) -> str:
 
     安全审计 (mysql_db._audit_sql):
       - 只允许 SELECT/SHOW/DESCRIBE/EXPLAIN/WITH (statement type 白名单)
-      - 拒绝 INSERT/UPDATE/DELETE/DROP/TRUNCATE/GRANT 等写操作
+      - 拒绝 INSERT/UPDATE/DELETE/DROP/TRUNCATE/GRANT 等写操作 (含 WITH+INSERT 绕过)
       - 拒绝多语句 (; 后面有内容)
       - 拒绝 INTO OUTFILE / LOAD DATA / LOAD_FILE / INFORMATION_SCHEMA
       - 拒绝注释注入 (-- / # / /* */) — 先 strip 再审计
       - 自动 LIMIT 1000 (防 OOM)
-      - 10s 查询超时 (execution_options)
+      - 10s 查询超时 (ThreadPoolExecutor client-side kill)
 
     返回: markdown 表格 (前 50 行 + 行数统计) 或 [安全审计拒绝] 错误.
     """
+    from mysql_db import build_engine, execute_safe_select  # 真正 lazy
     try:
         engine = build_engine()
         result_text, _ = execute_safe_select(engine, query)
