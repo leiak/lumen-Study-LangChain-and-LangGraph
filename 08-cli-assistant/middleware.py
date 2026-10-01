@@ -39,8 +39,15 @@ def _redact_string(content: str) -> str:
 
 
 @wrap_model_call
-def redact_pii(request, handler):
+async def redact_pii(request, handler):
     """把用户消息里的手机号/身份证号脱敏再发给 LLM.
+
+    ⚠️ 必须是 `async def` — LangChain 1.x middleware 在 async 上下文 (astream)
+    里要求 `awrap_model_call`, sync 版本会抛 `NotImplementedError`.
+    实测: 用 astream() 调用 agent 时, sync wrap_model_call 触发的报错:
+        "Asynchronous implementation of awrap_model_call is not available"
+    解: 整个函数写成 async, handler 也 await. `@wrap_model_call` 装饰器识别
+    coroutine function, 自动挂到 awrap_model_call 上 (无需双实现).
 
     注意: 不能原地改 m.content, 那会污染 agent state / checkpoint /
     trace. 用 model_copy 构造新消息 + 新 request, 保留原始 messages
@@ -58,7 +65,7 @@ def redact_pii(request, handler):
         new_messages.append(m)
     if changed:
         request = request.model_copy(update={"messages": new_messages})
-    return handler(request)
+    return await handler(request)
 
 
 # ============================================================
