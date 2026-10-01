@@ -138,10 +138,11 @@ def _make_data_agent(model):
             "你是 DataAgent. 用户问业务数据 (订单/用户/销售/统计等), 用 MySQL 工具.\n"
             "策略:\n"
             "  1. 第一次问: 先 list_tables 看有哪些表, 再 describe_table 查表结构\n"
-            "  2. 写 SQL: 只用 SELECT/SHOW, 不要 SELECT * (列名写全), 必须加 LIMIT\n"
+            "  2. 写 SQL: 只用 SELECT/SHOW, 不要 SELECT * (列名写全)\n"
             "  3. 复杂查询分步走, 中间结果用 subquery\n"
-            "  4. 查询超 1000 行: 加 WHERE/LIMIT/GROUP BY 缩小范围\n"
-            "run_sql 工具会自动触发人工审批 (HITL) — 直接调用, 不要在对话里确认. "
+            "  4. 查询超 1000 行: 加 WHERE/GROUP BY 缩小范围\n"
+            "run_sql 工具会自动 LIMIT 1000 + 10s 超时 + HITL 审批; 你只需专注 SQL 正确性. "
+            "直接调用工具, 不要在对话里确认. "
             "调完工具后用中文一句话 + 关键数字告诉用户."
         ),
         name="DataAgent",
