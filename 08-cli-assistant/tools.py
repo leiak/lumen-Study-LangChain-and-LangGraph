@@ -233,9 +233,15 @@ def run_sql(query: str) -> str:
       - 自动 LIMIT 1000 (防 OOM)
       - 10s 查询超时 (ThreadPoolExecutor client-side kill)
 
-    返回: markdown 表格 (前 50 行 + 行数统计) 或 [安全审计拒绝] 错误.
+    错误处理:
+      - MySQL 未配置: 友好提示 (RuntimeError)
+      - audit 拒绝: 转 [安全审计拒绝] 给 LLM (ValueError)
+      - SQL 执行错: 走 mysql_db._enrich_error 加 hint (表/列模糊匹配),
+        LLM 拿到 enriched 错误能 self-correct, 不用 user 介入
+
+    返回: markdown 表格 (前 50 行 + 行数统计) 或 [安全审计拒绝] / [SQL 执行失败] 错误.
     """
-    from mysql_db import build_engine, execute_safe_select  # 真正 lazy
+    from mysql_db import build_engine, execute_safe_select, _enrich_error  # 真正 lazy
     try:
         engine = build_engine()
         result_text, _ = execute_safe_select(engine, query)
@@ -245,6 +251,12 @@ def run_sql(query: str) -> str:
         # _audit_sql 拒绝: 转成 ToolMessage 给 LLM 看 (LLM 会改 SQL 重试)
         return f"[安全审计拒绝] {e}"
     except Exception as e:
-        # SQL 语法错 / 表不存在 / 连接断: 透传给 LLM
-        return f"[SQL 执行失败] {type(e).__name__}: {e}"
+        # SQL 语法错 / 表不存在 / 连接断: enrich 一下让 LLM 能 self-correct
+        try:
+            enriched = _enrich_error(engine, e)
+            return f"[SQL 执行失败] {enriched}"
+        except Exception:
+            # enrich 自己失败 (defensive — _enrich_error 设计上不 raise, 但兜底):
+            # 透传原始错误
+            return f"[SQL 执行失败] {type(e).__name__}: {e}"
     return result_text
