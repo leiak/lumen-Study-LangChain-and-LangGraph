@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
