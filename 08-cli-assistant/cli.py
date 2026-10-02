@@ -1,4 +1,4 @@
-"""cli.py — REPL 主循环 + 命令路由 + streaming token 打印 + HITL 审批.
+"""cli.py — REPL 主循环 + 命令路由 + streaming token 打印 + HITL 审批 + observability.
 
 REPL 流程:
   1. read() 读一行 stdin
@@ -7,12 +7,14 @@ REPL 流程:
   4. run_turn 内部: astream(stream_mode="messages") + 逐字 print
   5. 检测到 state.next 非空 + 有 interrupt → handle_hitl()
   6. 用户输入 a/r → Command(resume=...) 恢复
+  7. ⭐ 每个 turn 完成后打印 per-turn 指标 (latency/tokens/tools/specialist/cost)
 
 命令:
   /history   列出 checkpoints
   /rewind N  回到第 N 个 checkpoint (不重跑 LLM)
   /fork TXT  在新 thread 续走, 注入 TXT 作为新的人类消息
   /memory    查看/编辑长期偏好
+  /stats     Session 累计指标 (turns / tokens / latency / 路由 / cost)
   /help      帮助
   /quit, /exit  退出
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -29,6 +32,14 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from memory import get_prefs, set_pref
+from metrics import (
+    SessionMetrics,
+    TurnMetrics,
+    count_tool_calls,
+    detect_specialist,
+    estimate_cost,
+    extract_tokens,
+)
 
 # Supervisor 内部 routing 消息 (langgraph_supervisor 内部 AIMessage, 不该显示给用户)
 _SUPERVISOR_NOISE = (
@@ -53,6 +64,7 @@ WELCOME = """
 │    /fork TXT  改历史后在新 thread 续走      │
 │    /memory    查看/编辑长期偏好              │
 │    /mysql     探测 MySQL 连接 + 列表         │
+│    /stats     Session 累计指标 (token/cost)  │
 │    /help      帮助                           │
 │    /quit, /exit  退出                        │
 ╰─────────────────────────────────────────────╯
@@ -67,6 +79,7 @@ HELP_TEXT = """
   /memory            查看偏好
   /memory <key> <v>  设置偏好 (nickname / city / language / user_*)
   /mysql             探测 MySQL 连接 + 列出所有表 (含列结构)
+  /stats             Session 累计 (token/延迟/路由/cost)
   /help              本帮助
   /quit, /exit       退出
 
@@ -77,6 +90,9 @@ HELP_TEXT = """
   - "退款 #123 100"  → OrdersAgent 触发 HITL (输入 a/r 决策)
   - "写笔记 todo ..." → NotesAgent 触发 HITL
   - "北京有几个用户"  → DataAgent (调 list_tables → describe_table → run_sql 触发 HITL)
+
+每个 turn 完成后会自动打印一行指标:
+  >>> 280ms · in 124 / out 86 · 1 tools · WeatherAgent · ~$0.0001
 """
 
 
@@ -93,6 +109,8 @@ class CLI:
         store,
         store_namespace: tuple[str, str],
         thread_id: str = "cli-session-1",
+        session_metrics: SessionMetrics | None = None,
+        model_name: str = "",
     ):
         self.graph = graph
         self.checkpointer = checkpointer
@@ -104,6 +122,11 @@ class CLI:
         # 后续 invoke 会从 history[n] 这个 checkpoint 开始 (走 time-travel replay)
         # ⚠️ 一次性: run_turn 完成后会清掉, 不然会一直卡在分支上
         self._rewind_ckpt: str | None = None
+        # ⭐ Observability: 默认 None 时创建新的 SessionMetrics, 传入则复用 (测试场景)
+        self.metrics = session_metrics or SessionMetrics(model_name=model_name)
+        # model_name 单独存一份, 用于新 turn 的 cost 计算
+        # (避免 session_metrics 被外面改 model_name 后影响当前 CLI 实例)
+        self._model_name = model_name
 
     @property
     def config(self) -> dict[str, Any]:
@@ -199,6 +222,11 @@ class CLI:
 
         if cmd == "/mysql":
             self._cmd_mysql()
+            return False
+
+        if cmd == "/stats":
+            # ⭐ Session 累计指标 (turns / tokens / latency / 路由 / cost)
+            print(self.metrics.summary())
             return False
 
         print(f"未知命令: {cmd}. 输入 /help 查看.")
@@ -336,10 +364,13 @@ class CLI:
     # --------------------------------------------------------
     async def run_turn(self, text: str) -> None:
         print()  # 换行
+        # ⭐ 计时 — 包裹整个 _stream_and_print (含 astream 流式输出 + 错误捕获)
+        t0 = time.perf_counter()
         await self._stream_and_print(
             {"messages": [HumanMessage(content=text)]},
             self.config,
         )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
         # 检查是否需要 HITL 审批
         await self._maybe_hitl()
@@ -347,6 +378,28 @@ class CLI:
         # ⚠️ rewind 是一次性的: 跑完一个 turn 就清掉, 不然会一直 time-travel
         # 在那个分支上, 后续 /history 也只会看到 rewound 之后的子集.
         self._rewind_ckpt = None
+
+        # ⭐ Observability: 提取并打印 per-turn 指标
+        # try/except 包住: metrics 失败不阻塞 REPL (用户继续能对话)
+        try:
+            state = self.graph.get_state(self.config)
+            in_tok, out_tok = extract_tokens(state.values)
+            specialist = detect_specialist(state.values)
+            tools = count_tool_calls(state.values)
+            cost = estimate_cost(self._model_name, in_tok, out_tok)
+            tm = TurnMetrics(
+                latency_ms=elapsed_ms,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                tool_calls=tools,
+                specialist=specialist,
+                cost_usd=cost,
+            )
+            self.metrics.record(tm)
+            print(self.metrics.format_turn(tm))
+        except Exception as e:
+            # metrics 失败不阻塞 REPL — 仅打印一行 warning
+            print(f">>> [metrics error] {type(e).__name__}: {e}")
 
     async def _maybe_hitl(self) -> None:
         """如果 graph 在 interrupt 状态, 走 HITL 流程."""
