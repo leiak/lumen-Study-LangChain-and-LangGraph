@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import difflib
 import os
 import re
 import time
@@ -415,9 +416,130 @@ def _format_as_markdown(columns: list[str], rows: list[dict[str, Any]]) -> str:
     return "\n".join([header, sep, *body_lines]) + summary
 
 
+# ============================================================
+# SQL 错误 enrich — 把 raw SQLAlchemy 错误翻译成 LLM 能 self-correct 的 hint
+# ============================================================
+# 背景: run_sql 失败时 LLM 拿到的 str(error) 是 raw "OperationalError: (1146,
+# \"Table 'cli_demo.foo' doesn't exist\")", 没有可用的表名/列名线索, LLM 只能瞎改.
+# enrich 后, LLM 拿到 "表 'foo' 不存在. 你是想说: users, orders? 可用表 (3 张): ..."
+# 就能立刻改写 SQL 重试, 不需要 user 介入.
+#
+# 覆盖的 MySQL 错误码:
+#   1146 — Table doesn't exist          (表不存在, 找相似表名)
+#   1054 — Unknown column 'X' in 'Y'    (列不存在, 找相似列名 + 所在表)
+#   1052 — Column 'X' is ambiguous      (JOIN 列二义, 找含此列的表, 给 "t.X" 改写)
+#   其它 — 透传 raw str(error)
+#
+# 设计: _enrich_error 总是返回 string, **不会 raise**.
+#   - get_schema_summary 失败 → 透传 raw (没线索可给)
+#   - 错误码不识别 → 透传 raw
+#   - 模糊匹配为空 → 仍列出全部表/列, 不阻塞
+# -----------------------------------------------------------
+
+# describe 字符串格式 (示例):
+#   "  users 表结构:\n    id: int NOT NULL PRI\n    name: varchar(64) NOT NULL\n..."
+# _COL_LINE_RE 抓第二行起的 "    col_name: type ..." (第一行结构; 是表头)
+_COL_LINE_RE = re.compile(r"^\s+(\w+):\s+\w+", re.MULTILINE)
+
+
+def _extract_columns_from_describe(describe: dict[str, str]) -> list[tuple[str, str]]:
+    """从 get_schema_summary() 返回的 describe dict 提取 (table, column) 列表.
+
+    describe[t] 是多行 '  col: type ...' 格式. 第一行是表头 '  <t> 表结构:', 跳过.
+
+    假设 describe[t] 的格式固定 (由 get_schema_summary 生成). 如果以后改了输出
+    格式 (e.g. 加分隔符), 这个 regex 就 break — 守住靠单测.
+    """
+    pairs = []
+    for t, desc in describe.items():
+        for line in desc.splitlines():
+            m = _COL_LINE_RE.match(line)
+            if m:
+                pairs.append((t, m.group(1)))
+    return pairs
+
+
+def _enrich_error(engine: Engine, error: Exception) -> str:
+    """给 SQL 执行错误加 hint — 让 LLM 能 self-correct.
+
+    解析 MySQL 错误码, 用 cached schema 提供 "可用表/列" + "你是想说 ...?"
+    模糊匹配. 覆盖 1146 / 1054 / 1052; 其它错误码透传 raw str(error).
+
+    ⚠️ 自己 raise 时不动 (这里只 enrich 已有 exception). 调用方应该包 try/except
+    并兜底透传原始 str(error), 不要把 enrich 当可靠函数。
+
+    Args:
+        engine: SQLAlchemy engine (用于调 get_schema_summary 拿 schema).
+        error: SQL 执行异常 (e.g. sqlalchemy.exc.OperationalError).
+
+    Returns:
+        enriched 错误字符串. 永远不会 raise.
+    """
+    raw = str(error)
+
+    try:
+        tables, describe = get_schema_summary(engine)
+    except Exception:
+        # schema 拉不到 (连接断 / 权限不够), 没法 enrich — 透传 raw
+        return raw
+
+    # === 1146: Table doesn't exist ===
+    # SQLAlchemy 包装后格式: "(1146, \"Table 'cli_demo.foo' doesn't exist\")"
+    # 注意 MySQL 错误消息里 schema + table 用 '.' 连, 我们只关心 table 部分
+    m = re.search(r"Table\s+'(?P<t>[^']+)'\s+doesn't exist", raw, re.IGNORECASE)
+    if m:
+        bad = m.group('t').split('.')[-1]  # 去掉 schema 前缀 (e.g. "cli_demo.foo" → "foo")
+        suggestions = difflib.get_close_matches(bad, tables, n=3, cutoff=0.5)
+        msg = f"表 {bad!r} 不存在."
+        if suggestions:
+            msg += f" 你是想说: {', '.join(suggestions)}?"
+        if tables:
+            extra = "" if len(tables) <= 20 else " (前 20 张)"
+            msg += f" 可用表{extra} ({len(tables)} 张): {', '.join(tables[:20])}"
+        return msg
+
+    # === 1054: Unknown column ===
+    # SQLAlchemy 格式: "(1054, \"Unknown column 'foo' in 'field list'\")"
+    m = re.search(r"Unknown column\s+'(?P<c>\w+)'", raw, re.IGNORECASE)
+    if m:
+        bad_col = m.group('c')
+        pairs = _extract_columns_from_describe(describe)
+        col_names = [c for _, c in pairs]
+        suggestions = difflib.get_close_matches(bad_col, col_names, n=3, cutoff=0.5)
+        msg = f"列 {bad_col!r} 不存在."
+        if suggestions:
+            # 找出这些列在哪几张表
+            matched_tables = sorted({t for t, c in pairs if c in suggestions})
+            msg += f" 你是不是想用 (在表 {', '.join(matched_tables)}): {', '.join(suggestions)}?"
+        if col_names:
+            extra = "" if len(col_names) <= 30 else " (前 30 列)"
+            msg += f" 所有表的列{extra} ({len(col_names)} 列): {col_names[:30]}"
+        return msg
+
+    # === 1052: Ambiguous column (多表 JOIN) ===
+    # SQLAlchemy 格式: "(1052, \"Column 'foo' in 'order by' is ambiguous\")"
+    m = re.search(r"Column\s+'(?P<c>\w+)'.*?is ambiguous", raw, re.IGNORECASE)
+    if m:
+        bad_col = m.group('c')
+        pairs = _extract_columns_from_describe(describe)
+        # 找含此列的所有表 (SQL JOIN 时需要指定 t.column)
+        matched_tables = sorted({t for t, c in pairs if c == bad_col})
+        msg = f"列 {bad_col!r} 在多张表中存在, JOIN 时必须用 '表.列' 限定."
+        if matched_tables:
+            msg += f"  出现在: {', '.join(matched_tables)}."
+            rewrites = ", ".join(f"{t}.{bad_col}" for t in matched_tables[:3])
+            msg += f"  改写: {rewrites}"
+        return msg
+
+    # 其它错误码 (1064 syntax / 1364 no default / 1452 foreign key / ...): 透传
+    return raw
+
+
 __all__ = [
     "build_engine",
     "get_schema_summary",
     "execute_safe_select",
     "_audit_sql",
+    "_enrich_error",
+    "_extract_columns_from_describe",
 ]
