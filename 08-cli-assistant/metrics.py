@@ -192,7 +192,9 @@ class SessionMetrics:
         max_lat_str = f"{max_lat / 1000:.1f}s" if max_lat >= 1000 else f"{max_lat}ms"
 
         cost_str = (
-            f"~${total_cost:.4f} 估算 (model: {self.model_name})"
+            f"free (model: {self.model_name})"
+            if has_cost and total_cost == 0.0
+            else f"~${total_cost:.4f} 估算 (model: {self.model_name})"
             if has_cost
             else "? (model 不在 pricing 表)"
         )

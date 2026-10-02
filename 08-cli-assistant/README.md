@@ -190,7 +190,7 @@ base, 末尾追加语气行。
 - `extract_tokens(state)` — 从 final state AIMessages 求和, 按 `message.id` 去重
 - `detect_specialist(state)` — 反向遍历找最后一条带 `.name` 的 AIMessage
 - `count_tool_calls(state)` — 统计 ToolMessage 数量
-- `estimate_cost(model, in, out)` — substring 匹配 pricing 表 (5 个 family: Anthropic/DeepSeek/OpenAI/MiniMax)
+- `estimate_cost(model, in, out)` — substring 匹配 pricing 表 (4 个 family: Anthropic/DeepSeek/OpenAI/MiniMax, 9 个 entry)
 
 > ⚠️ `/fork` 后 `active_thread_id` 切换到新 thread — 后续 `/history` 和 `run_turn`
 > 都走新 thread, 主对话不被污染。
