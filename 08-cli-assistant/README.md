@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (phone + ID + mixed 不互相 mangled) · AST parse 8/7 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -130,13 +130,48 @@ CLI 只暴露 `[a]pprove` / `[r]eject` 两种 — 没有 `[e]dit`。
 常被误按成 `approve`, UX 上直接砍掉。
 `r` 之后会追问 "拒绝原因", 拼到 `{"type":"reject","reason":...}` 里回传。
 
+### HITL 影响预览
+
+approve 前 REPL 会先打印"将要发生什么" — 不盲签。
+
+| 工具 | 预览内容 |
+|---|---|
+| `run_sql` | SQL 全文 + 涉及表 (regex `\bFROM` 提取) + `EXPLAIN` 估算影响行数 + 执行计划摘要 |
+| `refund_order` | 订单号 + 当前金额 + 退款金额 + 退款后余额; 金额 > 10000 标 ⚠️ 业务上限 |
+| `write_note` | note name + content 预览 (前 50 字符) + 字节数 |
+
+实现 (`cli.py` `_HITL_PREVIEW_FNS`):
+- `_preview_run_sql` — `EXPLAIN _audit_sql(sql)` 走 ThreadPoolExecutor 5s 超时 (防 EXPLAIN 自身 hang), audit 保证 EXPLAIN 后面的 SELECT 也走白名单防注入; MySQL 未配置时降级到 `? (MySQL 未配置)` 不抛错
+- `_preview_refund_order` — 直接读 `_ORDERS` dict, 不调工具
+- `_preview_write_note` — 纯字符串处理, 无外部依赖
+- `_format_hitl_preview` — 路由 + try/except 包住, preview 失败只打 `[预览失败]` 一行, 不阻塞决策
+
+⚠️ **EXPLAIN + LIMIT**: `_audit_sql` 会给 SELECT 自动追加 `LIMIT 1000`, 所以
+`EXPLAIN SELECT * FROM users` 实际跑的是 `EXPLAIN SELECT * FROM users LIMIT 1000`
+(MySQL 完全支持 EXPLAIN + LIMIT, 语法合法)。
+
 ### PII 脱敏细节
 
-- 手机号 (11 位, `1[3-9]\d{9}`) → `1XX-XXXX-XXXX`
-- 身份证号 (18 位, `\d{17}[\dXx]`) → `1XXX-XXXX-XXXX-XXXX-X`
-- 身份证正则必须在手机号**之前** (顺序敏感 — 不然 ID 里的 11 位子串会被当成手机号 mangled)
-- 脱敏发生在 wrap_model_call 拦截器内, 用 `model_copy(update={...})` 构造新消息
-  不污染原 agent state / checkpoint / trace
+| PII 类型 | 正则 | 替换 |
+|---|---|---|
+| 身份证 (18位) | `\b\d{17}[\dXx]\b` | `1XXX-XXXX-XXXX-XXXX-X` |
+| 手机号 (11位) | `\b1[3-9]\d{9}\b` | `1XX-XXXX-XXXX` |
+| 银行卡 (16-19位纯数字) | `\b\d{16,19}\b` | `XXXX-XXXX-XXXX-XXXX` |
+| 邮箱 | `\b[\w.+-]+@[\w-]+\.[\w.-]+\b` | `<email>` |
+| IPv4 (4 段 0-255) | `\b(?:25[0-5]\|2[0-4]\d\|[01]?\d?\d)(?:\.(?:25[0-5]\|2[0-4]\d\|[01]?\d?\d)){3}\b` | `x.x.x.x` |
+
+**顺序敏感 (重要!)**: ID → 手机 → 银行卡 → 邮箱 → IPv4.
+- 身份证必须先于手机 (ID 里的 11 位子串会被手机 mangled)
+- 银行卡必须后于 ID/手机 (ID 的 18 位子串里可能含 16-19 位连续数字段)
+
+**负面用例** (不应被误判):
+- `010-12345678` (带连字符, 不是手机)
+- `2026-10-02` (有分隔符, 不是卡号/IP)
+- `12345.67` (不足 16 位, 不是银行卡)
+- `999.999.999.999` (段 > 255, 不匹配 IPv4)
+
+脱敏发生在 wrap_model_call 拦截器内, 用 `model_copy(update={...})` 构造新消息
+不污染原 agent state / checkpoint / trace。
 
 ### 动态语气细节
 
@@ -287,7 +322,9 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 3. **`create_supervisor` 要求 sub-agent 有 `name=`** — 没名字路由不了 (每个
    `create_agent` 必须 `name="WeatherAgent"` 等)。
 4. **PII 正则顺序敏感** — `\d{17}[\dXx]` 必须在 `1[3-9]\d{9}` 之前, 否则 ID
-   中间 11 位子串会被当成手机号 mangled, 身份证永远识别不出。
+   中间 11 位子串会被当成手机号 mangled, 身份证永远识别不出。同理, 银行卡
+   `\b\d{16,19}\b` 必须在 ID/手机之后 (ID 的 18 位子串里可能含 16-19 位连续
+   数字段)。
 5. **wrap_model_call 不要原地改 `m.content`** — 会污染 agent state /
    checkpoint / trace。必须 `m.model_copy(update={"content": new_content})`
    构造新消息。
@@ -309,6 +346,18 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
     supervisor") 没 name → 只 specialist final reply 有 name → `detect_specialist`
     反向遍历找第一个带 name 的 AIMessage, 结果就是最终被路由到的 specialist。
     如果用自定义 non-named agent, 会显示 `?`.
+13. **HITL preview EXPLAIN 防 hang** — `_preview_run_sql` 走 ThreadPoolExecutor
+    5s 超时 (罕见但 EXPLAIN 在某些死锁 / 大表 DDL 时会卡)。MySQL 未配置时
+    友好降级到 `? (MySQL 未配置)` 不抛错, preview 失败只打 `[预览失败]` 一行
+    不阻塞 REPL 决策。
+14. **HITL preview 走 `_audit_sql` 防注入** — `EXPLAIN` 后面的 SQL 同样经过
+    `_audit_sql` 白名单 (SELECT/SHOW/...)。如果 LLM 生成的 tool_call.args.query
+    本身就被 audit 拒, preview 会直接 raise, 被 `_format_hitl_preview` 的
+    try/except 接住, 打印 `[预览失败] ValueError: ...` 给用户看。
+15. **银行卡正则不吃连字符 / 空格** — `\b\d{16,19}\b` 只匹配纯数字连续段。
+    带连字符的卡号 `6222-0212-3456-7890` 不被匹配 (这是有意的: 用户输入带
+    格式的卡号时, 我们不脱敏 — 防 false positive; 生产可加 dedicated
+    `[\d-]{16,23}` 模式匹配带格式的卡号)。
 
 ## 复用项目内 demo
 
