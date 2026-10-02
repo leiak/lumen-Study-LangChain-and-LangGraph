@@ -12,21 +12,92 @@
   - read_note/write_note 的 name 限制 [a-z0-9_]+,防路径穿越
   - refund_order 金额 > 10000 拒绝 (业务规则)
   - run_sql 用 sqlparse + 白名单 statement type (SELECT/SHOW/...) + 自动 LIMIT 1000
+
+Notes 持久化 (JSONL):
+  - 数据文件: 08-cli-assistant/data/notes.jsonl (相对 tools.py)
+  - 格式: 每行 {"name": ..., "content": ..., "updated_at": ISO 时间戳}
+  - 启动加载: 模块 import 时 _load_notes() 读所有行, 同名取最后一条 (按文件顺序)
+  - 写入: write_note approve 后 append 一行 (失败不抛错, 内存已生效, 仅本条不持久化)
+  - 损坏行: JSON 解析失败 / KeyError 跳过该行, 不影响其它记录加载
 """
 from __future__ import annotations
 
 import ast
 import concurrent.futures
+import json
 import operator
 import re
+from datetime import datetime
+from pathlib import Path
+
 from langchain_core.tools import tool
 
 # ============================================================
-# Mock 数据 — 内存 dict,够 demo 用
+# 数据目录 — 跟 tools.py 同级的 data/ (运行时数据, .gitignore 排除)
 # ============================================================
-_NOTES: dict[str, str] = {
-    "todo": "买牛奶, 取快递, 交水电费",
-}
+_DATA_DIR = Path(__file__).parent / "data"
+_NOTES_FILE = _DATA_DIR / "notes.jsonl"
+
+
+# ============================================================
+# Mock 数据 — Notes 启动加载 JSONL, 其它内存 dict 够 demo 用
+# ============================================================
+def _load_notes() -> dict[str, str]:
+    """模块加载时从 JSONL 读所有笔记.
+
+    JSONL 格式: 每行 {"name": ..., "content": ..., "updated_at": ...}.
+    同名多条取最后一条 (按文件顺序, 即最新的覆盖 — 跟 git diff 类比,
+    "最后写入者赢").
+    单行 JSON 坏就跳过 — 一个坏行不 kill 整个加载 (REPL 还能起).
+
+    Returns:
+        dict[name, content]. 文件不存在 → 返回默认 seed.
+    """
+    if not _NOTES_FILE.exists():
+        return {"todo": "买牛奶, 取快递, 交水电费"}
+
+    notes: dict[str, str] = {}
+    try:
+        with open(_NOTES_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    # KeyError 也跳 (record 缺字段, 跳过)
+                    notes[rec["name"]] = rec["content"]
+                except (json.JSONDecodeError, KeyError):
+                    # 损坏行 / 缺字段: 不让一个坏记录 kill 整个加载
+                    continue
+    except OSError:
+        # 文件读不到: 退到默认 seed
+        return {"todo": "买牛奶, 取快递, 交水电费"}
+    return notes
+
+
+_NOTES: dict[str, str] = _load_notes()
+
+
+def _save_note(name: str, content: str) -> None:
+    """追加一条记录到 notes.jsonl. 写入失败不抛错 (defensive).
+
+    ⚠️ 故意不 raise: 用户已经 HITL approve 了, 写盘失败不应该让 user 觉得
+    操作失败. _NOTES 内存 dict 已更新 (UI 立刻生效), 磁盘持久化失败最多
+    下次重启丢这条. UX 优先于一致性.
+    """
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "name": name,
+            "content": content,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(_NOTES_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        # 写盘失败: 静默吞掉 (defensive). 用户无感, 下次重启仅丢这条.
+        pass
 _ORDERS: dict[str, dict] = {
     "#123": {"item": "LangChain 课程", "amount": 199.0, "status": "已付款"},
     "#456": {"item": "LangGraph 课程", "amount": 299.0, "status": "已发货"},
@@ -137,10 +208,15 @@ def read_note(name: str) -> str:
 
 @tool
 def write_note(name: str, content: str) -> str:
-    """(mock) 写笔记. name 必须是 [a-z0-9_]+. ⚠️ 触发 HITL 审批."""
+    """(mock) 写笔记. name 必须是 [a-z0-9_]+. ⚠️ 触发 HITL 审批.
+
+    持久化: approve 后写入 08-cli-assistant/data/notes.jsonl, REPL 重启后仍可读.
+    同名重复允许 — JSONL 多条都保留, 加载时取最后一条 (自然 history 效果).
+    """
     if not _NAME_RE.match(name):
         return f"name 非法: {name!r}"
-    _NOTES[name] = content
+    _NOTES[name] = content  # 内存立即生效 (UI 可见)
+    _save_note(name, content)  # 持久化 (失败不抛错, 见 _save_note docstring)
     return f"笔记 {name!r} 已写入 ({len(content)} 字符)"
 
 
