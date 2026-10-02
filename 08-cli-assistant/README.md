@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -42,6 +42,30 @@ python main.py
 
 > ⚠️ Shell 全局 `export ANTHROPIC_API_KEY=xxx` 会让 `.env` 改动失效。
 > 临时绕过: `env -u ANTHROPIC_API_KEY python main.py`。
+
+## Notes 持久化 (JSONL)
+
+`NotesAgent` 工具持久化到 `08-cli-assistant/data/notes.jsonl` — 写笔记不丢, 重启后还在.
+
+| 行为 | 实现 |
+|---|---|
+| 写入 | `write_note` approve 后 append 一行 JSON `{"name", "content", "updated_at"}` |
+| 启动加载 | 模块 import 时 `_load_notes()` 读所有行, 同名取最后一条 (按文件顺序) |
+| 数据丢失 | REPL 进程 `kill -9` 可能丢最后一条 (POSIX atomic append < 4KB 安全); 正常 `/quit` flush 完整 |
+| 损坏文件 | 单行 JSON 解析失败 graceful 跳过, 不影响其它记录加载 (REPL 仍能起) |
+| 写盘失败 | `OSError` 被吞, 内存 dict 已更新; 仅本条不持久化 (下次重启丢) |
+| 无文件首次启动 | 默认 seed `todo: 买牛奶, 取快递, 交水电费` (跟原版一样) |
+
+存储位置: `08-cli-assistant/data/notes.jsonl` (运行时数据, `.gitignore` 排除).
+同一条 note 多次写入会保留全部历史 — JSONL 多条都保留 (不 compact), 加载时取最后一条, 相当于自然 history 效果.
+
+### 已知坑 (Notes 持久化专属)
+
+- **`data/` 目录不在 git 里** — 加 `.gitignore`. 持久化是运行时数据, 不进版本
+- **REPL 进程 `kill -9` 可能丢最后一条** — POSIX atomic append 只在 < 4KB 安全. 笔记超长 (>4KB) 切两半. 一般用户不会
+- **同名 note 历史保留** — JSONL 多条都保留 (不 compact). 长期使用文件会涨. 1KB 一条, 1000 条 ≈ 1MB, 接受
+- **无并发锁** — 单进程 CLI 安全. 多 REPL 写同一文件会交错 (但 demo 阶段不发生)
+- **`_save_note` 写盘失败不抛错** — 用户已 HITL approve, 磁盘失败不阻止操作成功. 内存 dict 立即生效, 持久化失败仅下次重启丢这条. UX 优先于一致性
 
 ## MySQL 智能问数 (DataAgent, 第 5 个 specialist)
 
