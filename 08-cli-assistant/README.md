@@ -88,7 +88,7 @@ LLM 生成的 SQL 在执行前过 4 道关:
 
 - **自动 LIMIT 1000** — SELECT/WITH 没 LIMIT 时自动追加 (用 `_LIMIT_RE` 检测,
   不是简单 substring; 防 `LIMIT 1000000` 之类)
-- **10s 超时** — SQLAlchemy `execution_options={"timeout": 10}`
+- **10s 超时** — `concurrent.futures.ThreadPoolExecutor(max_workers=1).result(timeout=10.0)` (client-side kill, 不是 server-side cancel; 生产应 `SET SESSION MAX_EXECUTION_TIME=10000` 配 server-side)
 - **markdown 输出** — 表格前 50 行 + 总行数; 列宽 30 字符截断
 
 ### HITL 触发
