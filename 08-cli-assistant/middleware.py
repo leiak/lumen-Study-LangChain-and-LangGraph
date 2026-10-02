@@ -24,17 +24,46 @@ from langchain_core.messages import HumanMessage
 # 先于 11-char phone, 否则 phone 会把 ID 中间 11 位数字替换掉)
 # 之前 _PHONE_RE 先跑会把 18 位身份证号里的 11 位子串当成手机号 mangled,
 # 导致身份证号永远无法被识别 (review bug C1)
-_PII_RE = re.compile(r"\d{17}[\dXx]|1[3-9]\d{9}")
+#
+# 5 类 PII, 顺序敏感 (银行卡必须在 ID/手机之后, 否则 ID 里的 18 位子串的
+# 内部 16 位连续数字段会被当成卡号 mangled 错):
+#   1. ID (18字符)        → 1XXX-XXXX-XXXX-XXXX-X
+#   2. 手机号 (11字符)    → 1XX-XXXX-XXXX
+#   3. 银行卡 (16-19位)   → XXXX-XXXX-XXXX-XXXX
+#   4. 邮箱               → <email>
+#   5. IPv4 (4 段 0-255)  → x.x.x.x
+_ID_RE = re.compile(r"\b\d{17}[\dXx]\b")
+_PHONE_RE = re.compile(r"\b1[3-9]\d{9}\b")
+# 银行卡: 16-19 位连续数字 (银联 Visa MC JCB Diners)
+# ⚠️ 必须在 ID/手机之后 (ID 的 18 位子串里可能包含 16-19 位连续数字段)
+_BANK_CARD_RE = re.compile(r"\b\d{16,19}\b")
+# 邮箱: 标准 email 格式 (简化版, RFC 5322 完整正则太复杂)
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+# IPv4: 4 段 0-255, 段间 .
+_IPV4_RE = re.compile(
+    r"\b(?:25[0-5]|2[0-4]\d|[01]?\d?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3}\b"
+)
+
+# 顺序敏感 — 长/具体在前, 短/通用在后
+_PII_PATTERNS = [
+    (_ID_RE, "1XXX-XXXX-XXXX-XXXX-X"),       # 1. 身份证 (18字符, 最具体)
+    (_PHONE_RE, "1XX-XXXX-XXXX"),            # 2. 手机号 (11字符, 1[3-9]开头)
+    (_BANK_CARD_RE, "XXXX-XXXX-XXXX-XXXX"),  # 3. 银行卡 (16-19位纯数字)
+    (_EMAIL_RE, "<email>"),                  # 4. 邮箱
+    (_IPV4_RE, "x.x.x.x"),                   # 5. IPv4
+]
 
 
 def _redact_string(content: str) -> str:
-    """单 pass 脱敏: 先 ID (18字符), 再 phone (11字符)."""
-    for m in _PII_RE.finditer(content):
-        s = m.group(0)
-        if len(s) == 18:  # 身份证号
-            content = content.replace(s, "1XXX-XXXX-XXXX-XXXX-X")
-        else:  # 手机号 (11 数字)
-            content = content.replace(s, "1XX-XXXX-XXXX")
+    """单 pass 脱敏: 按 _PII_PATTERNS 顺序逐个替换.
+
+    ⚠️ 为什么不用一个 giant alternation regex (e.g. `id|phone|bank|email|ipv4`)?
+    因为每个 pattern 的 replacement 不同 — giant regex 只能给一个统一 repl.
+    所以拆成 list, 顺序 sub (顺序敏感: 长/具体在前).
+    """
+    for pattern, repl in _PII_PATTERNS:
+        content = pattern.sub(repl, content)
     return content
 
 
