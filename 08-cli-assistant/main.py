@@ -22,6 +22,7 @@ from _common import banner, get_llm
 from agent import build_graph
 from cli import CLI
 from memory import build_store
+from metrics import SessionMetrics
 
 
 def main() -> int:
@@ -79,8 +80,17 @@ def main() -> int:
         print(f"[error] 装配 graph 失败: {type(e).__name__}: {e}")
         return 1
 
+    # 2.7 ⭐ Observability: 取 model_name 喂给 SessionMetrics (用于 cost 估算)
+    # LangChain ChatModel 都有 .model_name 属性; 取不到 → "" (cost 显示 "?")
+    model_name = getattr(llm, "model_name", "") or ""
+    session_metrics = SessionMetrics(model_name=model_name)
+
     # 3. 启动 REPL
-    cli = CLI(graph, checkpointer, store, namespace)
+    cli = CLI(
+        graph, checkpointer, store, namespace,
+        session_metrics=session_metrics,
+        model_name=model_name,
+    )
     try:
         asyncio.run(cli.run())
     except KeyboardInterrupt:
