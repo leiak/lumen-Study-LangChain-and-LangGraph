@@ -96,6 +96,29 @@ LLM 生成的 SQL 在执行前过 4 道关:
 `run_sql` 也挂 HITL — 即使审计通过, 也让用户在终端看到实际 SQL 再 approve。
 UX 跟 `refund_order` / `write_note` 一致: `[a]pprove` / `[r]eject` (cli.py `_maybe_hitl`)。
 
+### SQL 错误 enrich (`mysql_db._enrich_error`)
+
+当 SQL 执行失败, 给 LLM 自愈线索 — 不再透传无情报的 raw str(e), 而是解析 MySQL 错误码
++ difflib 模糊匹配, 让 LLM 拿到 enriched 错误就**自动改 SQL 重试**, 不用 user 介入。
+
+| MySQL 错误码 | 含义 | enrich 内容示例 |
+|---|---|---|
+| 1146 | Table doesn't exist | `表 'enterprises' 不存在. 你是想说: users? 可用表 (3 张): users, orders, order_items` |
+| 1054 | Unknown column | `列 'usr_name' 不存在. 你是不是想用 (在表 orders, users): name, user_id? 所有表的列 (10 列): [...]` |
+| 1052 | Ambiguous column (JOIN) | `列 'id' 在多张表中存在, JOIN 时必须用 '表.列' 限定.  出现在: order_items, orders, users.  改写: order_items.id, orders.id, users.id` |
+| 其它 (1064 syntax, 1364 no default, ...) | 透传 raw `str(error)` | `(1064, "You have an error in your SQL syntax...")` |
+
+实现细节:
+- `_extract_columns_from_describe(describe_dict)` — 从 `get_schema_summary()` 的多行描述
+  parse 出 `(table, column)` 元组列表 (regex `^\s+(\w+):\s+\w+`)
+- `difflib.get_close_matches(bad, candidates, n=3, cutoff=0.5)` — 模糊匹配, 给 "你是想说 ...?" 提示
+- `_enrich_error` **不 raise** — 总异常自包装, get_schema_summary 拉不到 schema 或错误码不识别时
+  透传 raw str(error)
+- `run_sql` 错误路径包 try/except, enrich 自身失败时再兜底透传原始 (defensive)
+
+实测优势: LLM 拿到 "列 'usr_name' 不存在. 你是不是想用 (在表 users): name?" 后**自动改写** SQL
+成 `SELECT name FROM users WHERE ...`, 不用 user 介入。
+
 ### 已知坑
 
 - **`create_supervisor` 要求 sub-agent 有 `name=`** — 没名字路由不了 (每个
@@ -107,6 +130,15 @@ UX 跟 `refund_order` / `write_note` 一致: `[a]pprove` / `[r]eject` (cli.py `_
 - **MySQL 没装 / .env 没配 → 启动不阻塞** — `main.py` 用 try/except 包住
   `build_engine()`, 失败时打印 `>>> MySQL: 未配置 (...)`. 其它 4 个 specialist
   仍能用。
+- **`get_schema_summary` 缓存命中率** — enrich 强依赖 60s TTL 缓存的 schema。如果
+  LLM 在对话中改了表结构 (e.g. ALTER ADD COLUMN), 60s 内 enrich 还用旧 schema →
+  "列不存在" 判断可能不准。TTL 到期或重启进程会自然 refresh。
+- **`_extract_columns_from_describe` 假设固定格式** — 如果以后 `get_schema_summary`
+  改了 describe 输出格式 (e.g. 加分隔符 / 改缩进), regex 就 silent fail。守住靠
+  单测 (`assert len(pairs) == 6` 之类)。
+- **difflib cutoff 0.5 对短列名可能误判** — 2-3 字符的列名 (`id`, `age`) cutoff
+  应更高 (0.7)。但默认 0.5 够用 — `'id'` 在 users/orders/order_items 三表都有 →
+  走 1052 路径全部列出, 不需要 fuzzy match。
 
 ## 7 个手测场景
 
