@@ -24,6 +24,9 @@ env/
 .coverage
 htmlcov/
 
+# Runtime data (CLI assistant persistence)
+08-cli-assistant/data/
+
 # IDE
 .idea/
 .vscode/
