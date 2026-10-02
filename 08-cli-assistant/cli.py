@@ -21,6 +21,7 @@ REPL 流程:
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import time
 from typing import Any
@@ -46,6 +47,116 @@ _SUPERVISOR_NOISE = (
     "Transferring back to supervisor",
     "Successfully transferred back to supervisor",
 )
+
+
+# ============================================================
+# HITL 预览 — 每个工具调用前的"影响预览"
+# ============================================================
+# 目标: 用户 approve 前看到"将要发生什么", 而不是盲签.
+# 三个 HITL 工具 (run_sql / refund_order / write_note) 各自有一个 preview 函数,
+# 在 `_maybe_hitl` 决策前打印 3-5 行影响摘要.
+_HITL_PREVIEW = ("run_sql", "refund_order", "write_note")
+
+
+def _preview_run_sql(args: dict) -> list[str]:
+    """run_sql 预览: SQL 全文 + EXPLAIN 估算影响行数 + 涉及表/列.
+
+    EXPLAIN 在 audit 后执行, 不计入 hitl approve — 是只读 SHOW query plan.
+    走 ThreadPoolExecutor 防止 EXPLAIN 自身 hang (罕见但可能).
+    """
+    sql = args.get("query", "")
+    lines = [f"  SQL: {sql}"]
+    # 从 SQL 简单提取表名 (regex \\bFROM\\s+`?(\\w+))
+    tables = re.findall(r"\bFROM\s+`?(\w+)", sql, re.IGNORECASE)
+    if tables:
+        lines.append(f"  表: {', '.join(set(tables))}")
+    # 跑 EXPLAIN 估行数 — 走 ThreadPoolExecutor 防 hang
+    try:
+        import concurrent.futures
+        from sqlalchemy import text
+        from mysql_db import build_engine, _audit_sql
+        engine = build_engine()
+        # 走 _audit_sql 保证 EXPLAIN 后面的 SELECT 也是 audit 过的 (防注入)
+        explained_sql = f"EXPLAIN {_audit_sql(sql)}"
+
+        def _explain():
+            with engine.connect() as conn:
+                rows = conn.execute(text(explained_sql)).mappings().all()
+                return [dict(r) for r in rows]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            f = ex.submit(_explain)
+            try:
+                rows = f.result(timeout=5.0)
+            except concurrent.futures.TimeoutError:
+                lines.append("  预估行数: ? (EXPLAIN 超时 5s)")
+                return lines
+        # EXPLAIN 返回字段: table, type, rows (估算), Extra, ...
+        total_rows = sum(int(r.get("rows") or 0) for r in rows)
+        lines.append(f"  预估影响行数: ~{total_rows} (EXPLAIN 估算)")
+        extras = [r.get("Extra", "") for r in rows if r.get("Extra")]
+        if extras:
+            lines.append(f"  执行计划: {'; '.join(set(extras))[:80]}")
+    except RuntimeError:
+        # MySQL 未配置 — 跳过 EXPLAIN, 不阻塞 REPL
+        lines.append("  预估行数: ? (MySQL 未配置)")
+    except Exception as e:
+        lines.append(f"  预估行数: ? ({type(e).__name__})")
+    return lines
+
+
+def _preview_refund_order(args: dict) -> list[str]:
+    """refund_order 预览: 订单 + 退款金额 + 余额 + 业务上限."""
+    from tools import _ORDERS, _norm_order_id
+    oid = _norm_order_id(args.get("order_id", ""))
+    try:
+        amount = float(args.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    info = _ORDERS.get(oid)
+    lines = [f"  订单: {oid}"]
+    if info is None:
+        lines.append(f"  ⚠️  订单 {oid} 不存在 (demo 内置 #123 / #456)")
+        return lines
+    lines.append(f"  当前金额: ¥{info['amount']:.2f} ({info['item']})")
+    lines.append(f"  退款: ¥{amount:.2f}")
+    if amount > 10000:
+        lines.append(f"  ⚠️  超过业务上限 10000, 会被业务拒绝")
+    lines.append(f"  退款后余额: ¥{info['amount'] - amount:.2f}")
+    return lines
+
+
+def _preview_write_note(args: dict) -> list[str]:
+    """write_note 预览: name + content 预览 + 字节数."""
+    name = args.get("name", "")
+    content = args.get("content", "")
+    preview = content[:50] + ("..." if len(content) > 50 else "")
+    return [
+        f"  name: {name}",
+        f"  content ({len(content)} 字符): {preview}",
+    ]
+
+
+_HITL_PREVIEW_FNS = {
+    "run_sql": _preview_run_sql,
+    "refund_order": _preview_refund_order,
+    "write_note": _preview_write_note,
+}
+
+
+def _format_hitl_preview(tool_name: str, args: dict) -> list[str]:
+    """根据 tool_name 路由到对应 preview 函数.
+
+    ⚠️ 不在 _maybe_hitl 主体里 raise — preview 失败只打一行 warning,
+    不阻塞 HITL 决策 (用户还是能看到原始 intr dict).
+    """
+    fn = _HITL_PREVIEW_FNS.get(tool_name)
+    if fn is None:
+        return [f"  (无预览: {tool_name})"]
+    try:
+        return fn(args)
+    except Exception as e:
+        return [f"  [预览失败] {type(e).__name__}: {e}"]
 
 
 # ============================================================
@@ -418,6 +529,19 @@ class CLI:
         if isinstance(intr, dict):
             for k, v in intr.items():
                 print(f"  {k}: {v}")
+            # ⭐ 工具调用预览 — 在决策前显示"将要发生什么"
+            # LangGraph HITL 中断的 intr dict 通常含 "tool_calls" list,
+            # 每项 {name, args, id}. 我们按 name 路由到对应 preview.
+            tool_calls = intr.get("tool_calls", []) if isinstance(intr, dict) else []
+            if tool_calls:
+                print()
+                for tc in tool_calls:
+                    tname = tc.get("name", "?")
+                    targs = tc.get("args", {})
+                    print(f"  [{tname}] 预览:")
+                    for line in _format_hitl_preview(tname, targs):
+                        print(line)
+                    print()
         else:
             print(f"  {intr}")
 
