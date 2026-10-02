@@ -164,7 +164,33 @@ base, 末尾追加语气行。
 | `/memory` | 查看长期偏好 (`InMemoryStore` namespace) |
 | `/memory <key> <v>` | 设置偏好 (内置: `nickname`/`city`/`language`; 自定义: 必须 `user_xxx` 前缀) |
 | `/mysql` | 探测 MySQL 连接 + 列出表结构 (运维视角, 绕过 LLM) |
+| `/stats` | Session 累计: turns / tokens / latency / 路由 / cost |
 | `/quit`, `/exit` | 退出 REPL |
+
+## Observability (per-turn 指标 + /stats 累计)
+
+每个 turn 完成后, REPL 自动打印一行指标 (latency / tokens / tools / specialist / cost):
+
+```
+>>> 280ms · in 124 / out 86 · 1 tools · WeatherAgent · ~$0.0001
+```
+
+`/stats` 打印 session 累计:
+
+```
+>>> Session 统计 (12 turns):
+   tokens:   in 1,420 / out 980  ·  tools 18
+   latency:  avg 245ms · max 1.2s
+   routed:   Calc 2 · Data 1 · Notes 4 · Orders 2 · Weather 3
+   cost:     ~$0.0042 估算 (model: claude-sonnet-5)
+```
+
+实现见 `metrics.py` (~216 LOC):
+- `TurnMetrics` / `SessionMetrics` dataclass
+- `extract_tokens(state)` — 从 final state AIMessages 求和, 按 `message.id` 去重
+- `detect_specialist(state)` — 反向遍历找最后一条带 `.name` 的 AIMessage
+- `count_tool_calls(state)` — 统计 ToolMessage 数量
+- `estimate_cost(model, in, out)` — substring 匹配 pricing 表 (5 个 family: Anthropic/DeepSeek/OpenAI/MiniMax)
 
 > ⚠️ `/fork` 后 `active_thread_id` 切换到新 thread — 后续 `/history` 和 `run_turn`
 > 都走新 thread, 主对话不被污染。
@@ -275,6 +301,14 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 9. **HITL 协议层有 3 种 decision, CLI 只暴露 2 种** — `edit` 在协议层支持,
    但 UX 上常被误按成 `approve`, CLI 直接砍掉。
 10. **`InMemoryStore` 重启即丢** — 演示用够, 生产换 `PostgresStore.from_conn_string(...)`。
+11. **`usage_metadata` 部分 provider 不返回 (e.g. MiniMax M3 内测)** — token 显示 0
+    但 cost 仍算 (M3 在 pricing 表里 cost=0, 所以没影响); 其它未接 pricing 的模型
+    cost 显示 `$?` 而不是金额.
+12. **specialist 检测基于 `AIMessage.name`** — 取决于 LangChain 是否设置。
+    langgraph_supervisor 内部 routing AIMessage (e.g. "Transferring back to
+    supervisor") 没 name → 只 specialist final reply 有 name → `detect_specialist`
+    反向遍历找第一个带 name 的 AIMessage, 结果就是最终被路由到的 specialist。
+    如果用自定义 non-named agent, 会显示 `?`.
 
 ## 复用项目内 demo
 
