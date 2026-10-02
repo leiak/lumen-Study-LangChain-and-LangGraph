@@ -1,1 +1,46 @@
 content='LangChain 1.x 是一个用于构建大语言模型（LLM）应用的开源框架，通过模块化组件（如模型、提示、链、记忆、检索和代理）简化了 LLM 与外部数据源、工具及彼此之间的编排与集成。' additional_kwargs={'refusal': None} response_metadata={'token_usage': {'completion_tokens': 57, 'prompt_tokens': 13, 'total_tokens': 70, 'completion_tokens_details': None, 'prompt_tokens_details': {'audio_tokens': None, 'cached_tokens': 0}, 'prompt_cache_hit_tokens': 0, 'prompt_cache_miss_tokens': 13}, 'model_provider': 'openai', 'model_name': 'deepseek-flash', 'system_fingerprint': 'aeb56401ca74e127821c4f9126dcb669', 'id': '73cd9051-9914-445f-9ff2-939f3732971c', 'finish_reason': 'stop', 'logprobs': None} id='lc_run--01a089d5-6d64-7943-88e7-3e7b032c6f82-0' tool_calls=[] invalid_tool_calls=[] usage_metadata={'input_tokens': 13, 'output_tokens': 57, 'total_tokens': 70, 'input_token_details': {'cache_read': 0}, 'output_token_details': {}}
+
+
+整理后如下：
+
+### content
+> LangChain 1.x 是一个用于构建大语言模型（LLM）应用的开源框架，通过模块化组件（如模型、提示、链、记忆、检索和代理）简化了 LLM 与外部数据源、工具及彼此之间的编排与集成。
+
+### 消息信息
+- id: `lc_run--01a089d5-6d64-7943-88e7-3e7b032c6f82-0`
+- tool_calls: `[]`
+- invalid_tool_calls: `[]`
+- additional_kwargs.refusal: `None`
+
+### response_metadata
+```yaml
+model_provider: openai
+model_name: deepseek-flash
+system_fingerprint: aeb56401ca74e127821c4f9126dcb669
+id: 73cd9051-9914-445f-9ff2-939f3732971c
+finish_reason: stop
+logprobs: null
+
+token_usage:
+  prompt_tokens: 13
+  completion_tokens: 57
+  total_tokens: 70
+  prompt_cache_hit_tokens: 0
+  prompt_cache_miss_tokens: 13
+  completion_tokens_details: null
+  prompt_tokens_details:
+    audio_tokens: null
+    cached_tokens: 0
+```
+
+### usage_metadata
+```yaml
+input_tokens: 13
+output_tokens: 57
+total_tokens: 70
+input_token_details:
+  cache_read: 0
+output_token_details: {}
+```
+
+核心信息就是：模型为 `deepseek-flash`，输入 13 tokens，输出 57 tokens，总计 70 tokens，结束原因为 `stop`。

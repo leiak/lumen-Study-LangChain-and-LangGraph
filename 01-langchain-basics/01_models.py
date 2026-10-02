@@ -207,10 +207,10 @@ if __name__ == "__main__":
         print("请先在 .env 中设置 ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY")
         raise SystemExit(1)
 
-    # demo_basic_invoke()
+    demo_basic_invoke()
     # demo_stream()
     # demo_structured_output()
     # demo_bind_tools()
-    demo_multi_turn()
+    # demo_multi_turn()
 
     print("\n[OK] 01_models.py 全部 demo 跑完。")
