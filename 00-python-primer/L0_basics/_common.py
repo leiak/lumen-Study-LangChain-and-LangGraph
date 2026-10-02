@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import warnings
 from pathlib import Path
+import sys
 
 # ============================================================
 # 静音 langgraph 1.x 加载时的 known warning
@@ -187,3 +188,10 @@ def banner(title: str) -> None:
     """打印分节标题."""
     bar = "=" * 60
     print(f"\n{bar}\n  {title}\n{bar}")
+
+def setup() -> None:
+    """Windows 终端 UTF-8 修复。
+    原因: Windows cmd 默认 GBK, print emoji / 中文 content 可能 UnicodeEncodeError。
+    """
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")

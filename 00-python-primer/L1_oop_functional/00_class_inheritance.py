@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _common import banner, setup
+from .._common import banner, setup
 
 
 def demo_basic_inheritance() -> None:
