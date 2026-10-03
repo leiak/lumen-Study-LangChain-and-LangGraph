@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful) · /diff OK (forward/backward/empty/invalid index/same/non-int)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -226,6 +226,7 @@ LLM 看到的 SQL 执行, 在 retry 层是不透明的 — 只有当 retry 全�
 | 8 | `/mysql` (需先 `mysql < schema.sql`) | 列出 users / orders / order_items 三表 + 列结构 |
 | 9 | `北京有几个用户` (DataAgent) | 调 `list_tables` → `describe_table users` → `run_sql SELECT COUNT(*) ... WHERE city='北京'`, 触发 HITL 输入 `a` 通过, 返回 `1` |
 | 10 | `哪个商品卖得最好` (DataAgent 复杂查询) | 调 `list_tables` → `describe_table order_items` → `run_sql SELECT product, SUM(quantity)... GROUP BY product ORDER BY SUM(quantity) DESC LIMIT 1`, HITL 通过 |
+| 11 | 跑 3 轮对话 → `/history` → `/diff 1 3` | 列出 1→3 之间新增 message + token delta + latency delta (只读) |
 
 ### HITL 决策细节
 
@@ -298,6 +299,7 @@ base, 末尾追加语气行。
 |---|---|
 | `/help` | 帮助 |
 | `/history` | 列出本 thread 所有 checkpoint (history[0]=最新) |
+| `/diff <a> <b>` | 比较两个 checkpoint 差异 (message + tokens + latency, 只读) |
 | `/rewind N` | 回到 history[N] 的状态 — **一次性**, 下个 turn 后自动清 |
 | `/fork <text>` | 在最新 checkpoint 上追加 text, 用 `update_state` 创建新 thread 续走 |
 | `/memory` | 查看长期偏好 (`InMemoryStore` namespace) |
@@ -305,6 +307,81 @@ base, 末尾追加语气行。
 | `/mysql` | 探测 MySQL 连接 + 列出表结构 (运维视角, 绕过 LLM) |
 | `/stats` | Session 累计: turns / tokens / latency / 路由 / cost |
 | `/quit`, `/exit` | 退出 REPL |
+
+## /diff 时间旅行 diff (互补 /history / /rewind / /fork)
+
+`/diff` 把 4 个 time-travel 命令凑成完整 UX:
+
+| 命令 | 角色 |
+|---|---|
+| `/history` | 看 checkpoints 列表 (含 latency) |
+| `/diff <a> <b>` | **决定走哪条路** (分析 added/removed + token/latency delta) |
+| `/rewind N` | 回到 N (一次性, 不重跑 LLM) |
+| `/fork <text>` | 在新 thread 续走 (主对话不被污染) |
+
+不调 LLM, 不动 `pending_checkpoint_id`, 纯只读分析 — 安全反复试。
+
+### 命令语法
+
+```
+/diff <a> <b>      1-based 索引 (跟 /history 列表 1:1), 顺序无关
+```
+
+### 输出示例 (forward)
+
+```
+>>> Diff #1 → #3 (old→new):
+  + 3 added, 0 removed
+  Δ tokens: +224 in / +136 out
+  Δ latency: +2000ms
+
+  + AIMessage (WeatherAgent): '北京 晴 25°C'
+  + ToolMessage: '{"temp":25}'
+  + AIMessage (WeatherAgent): '北京 25 度, 适合出行'
+```
+
+### 输出示例 (backward — `/diff 3 1`, rewind 决策辅助)
+
+```
+>>> Diff #3 → #1 (new→old):
+  + 0 added, 3 removed
+  Δ tokens: -224 in / -136 out
+  Δ latency: -2000ms
+
+  - AIMessage (WeatherAgent): '北京 晴 25°C'
+  - ToolMessage: '{"temp":25}'
+  - AIMessage (WeatherAgent): '北京 25 度, 适合出行'
+```
+
+### 实战用法
+
+- **决策 `/rewind` 还是 `/fork`** — 先 `/diff N 0` 看回到 N 会丢什么 message / token,
+  如果丢的少 → `/rewind` (in-place); 如果丢的多 / 想换方向 → `/fork` (新 thread).
+- **token cost 预演** — `/diff 1 3` 的 `Δ tokens` 是真实 LLM 用量 (走 `extract_tokens`
+  复用, 按 `message.id` 去重), 可以粗估"如果回到这里重走要花多少".
+- **debug 异常 turn** — 哪个 turn 出现 tool call loop / 异常输出, `/diff N-1 N`
+  直接看新加了什么 message, 不用 replay.
+
+### 边界处理
+
+| 场景 | 输出 |
+|---|---|
+| 无 args | `usage: /diff <a> <b> (checkpoint 索引, 1-based)` |
+| `<a>`/`<b>` 非 int | 同上 |
+| 索引越界 (e.g. `/diff 1 99`) | `>>> checkpoint 索引越界, 跑 /history 看可用索引 (1-N)` |
+| `a == b` | `>>> Diff #X → #X: 同一 checkpoint, 无变化` |
+| 没跑过 `/history` | `>>> 没有 history, 先跑 /history` |
+
+### 实现要点 (`cli.py`)
+
+- `self.history_checkpoints: list[dict]` — `/history` 跑时填充,
+  每项 `{id, msgs, latency_ms, next}`, `/diff` 直接用, 不再 query `get_state_history`
+- `_parse_iso_ms` — `StateSnapshot.created_at` (ISO 8601) → ms; 兼容 `Z` 后缀,
+  parse 失败返 0 不阻塞 diff
+- `_print_msg_line` — message 一行摘要 (`type + (name) + 50 字符 content`),
+  list content (tool_calls 块) 转 str 避免 repr 爆炸
+- `_cmd_diff` — `graph.get_state(tid, ckpt_id)` 两边 → `message.id` 去重 set diff
+  (fallback `id(msg)` 处理 id 偶发 None) → `extract_tokens` 复用算 delta
 
 ## Observability (per-turn 指标 + /stats 累计)
 
@@ -474,6 +551,18 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
 18. **`_extract_errno` 5 层嵌套防爆 (transient retry)** — 实际 SQLAlchemy 异常链
     通常 1-2 层 (`.orig.args[0]`), 5 层足够防 `.orig.orig.orig.orig.orig` 极端
     情况。某些 library 包装可能更深的链, 但概率极低 — 5 层守底安全。
+19. **`message.id` 偶尔 None (`/diff` 去重)** — LangGraph 的 message.id 不是
+    100% 都有 (某些 middleware 注入的 message 不带 id)。`/diff` fallback 到
+    `id(msg)` (Python object id) — 跨进程比较会失效, 但 REPL 单进程安全。
+    真要跨进程 diff 需要在 message 注入时强制 `id=uuid4()`。
+20. **`/diff` 后调 `/rewind` 不会重新 fetch (`/diff` 纯 read-only)** —
+    `/diff` 只读 `self.history_checkpoints`, 不动 `_rewind_ckpt` 也不调
+    `invoke` / `astream`。后续 `/rewind` 仍按 `history_checkpoints` 当前索引
+    走, 不受 `/diff` 影响。/rewind 想重新看 history 先 `/history` 刷新列表。
+21. **Token delta 包含 provider 重叠 (`/diff` `Δ tokens`)** — LangGraph
+    checkpoint replay 偶有同一 message 多副本 (supervisor 转回 / 中断 retry)。
+    `extract_tokens` 按 `message.id` 去重, `/diff` 两边都走同一函数, 所以
+    delta 数学稳。但 ±5% 误差可接受 — 不要拿这个数当精确 cost 预测。
 
 ## 复用项目内 demo
 
