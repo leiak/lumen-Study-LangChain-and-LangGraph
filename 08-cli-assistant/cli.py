@@ -673,27 +673,49 @@ class CLI:
             # metrics 失败不阻塞 REPL — 仅打印一行 warning
             print(f">>> [metrics error] {type(e).__name__}: {e}")
 
-    async def _maybe_hitl(self) -> None:
-        """如果 graph 在 interrupt 状态, 走 HITL 流程."""
-        state = self.graph.get_state(self.config)
-        if not state.next:
-            return  # 正常结束, 不需要审批
+    async def _maybe_hitl(self, interrupts: list | None = None) -> None:
+        """如果 graph 在 interrupt 状态, 走 HITL 流程.
 
-        # 拿 interrupt 内容 (state.tasks[0].interrupts[0].value)
-        if not (state.tasks and state.tasks[0].interrupts):
-            print(f"\n>>> 暂停在 {state.next}, 但无 interrupt 内容, 跳过 HITL")
+        interrupts: 生产为 None, 内部从 state 拿 (state.tasks[0].interrupts);
+        测试可直接传 Interrupt-like mock 列表, 跳过 state fetch.
+
+        分发:
+          0 个 → return
+          1 个 → _handle_single_interrupt (现有 UX 保留)
+          N 个 → _handle_batch_interrupts (批量预览 + 单决策 prompt)
+        """
+        # 生产路径: 从 state 拿 interrupts
+        if interrupts is None:
+            state = self.graph.get_state(self.config)
+            if not state.next:
+                return  # 正常结束, 不需要审批
+            if not (state.tasks and state.tasks[0].interrupts):
+                print(f"\n>>> 暂停在 {state.next}, 但无 interrupt 内容, 跳过 HITL")
+                return
+            interrupts = list(state.tasks[0].interrupts)
+        if not interrupts:
             return
+        if len(interrupts) == 1:
+            await self._handle_single_interrupt(interrupts[0])
+        else:
+            await self._handle_batch_interrupts(interrupts)
 
-        intr = state.tasks[0].interrupts[0].value
+    async def _handle_single_interrupt(self, intr) -> None:
+        """单 interrupt 流程 — 现有 UX 保留, 不变.
+
+        prompt 风格保持 `[a]pprove / [r]eject` 不变 (向后兼容).
+        """
+        state = self.graph.get_state(self.config)
+        intr_value = intr.value if hasattr(intr, "value") else intr
         print(f"\n\n[!]  HITL 中断 (节点 {state.next}):")
         # intr 是 dict, 包含 tool_call / reason
-        if isinstance(intr, dict):
-            for k, v in intr.items():
+        if isinstance(intr_value, dict):
+            for k, v in intr_value.items():
                 print(f"  {k}: {v}")
             # ⭐ 工具调用预览 — 在决策前显示"将要发生什么"
             # LangGraph HITL 中断的 intr dict 通常含 "tool_calls" list,
             # 每项 {name, args, id}. 我们按 name 路由到对应 preview.
-            tool_calls = intr.get("tool_calls", []) if isinstance(intr, dict) else []
+            tool_calls = intr_value.get("tool_calls", []) if isinstance(intr_value, dict) else []
             if tool_calls:
                 print()
                 for tc in tool_calls:
@@ -704,7 +726,7 @@ class CLI:
                         print(line)
                     print()
         else:
-            print(f"  {intr}")
+            print(f"  {intr_value}")
 
         # 读决策 — 只暴露 approve / reject 给用户.
         # LangGraph 协议层仍允许 ["approve","edit","reject"] 三种 type, 但 CLI 不提供 edit:
@@ -726,6 +748,183 @@ class CLI:
 
         # resume - 走同一份 _stream_and_print 辅助
         await self._stream_and_print(Command(resume=decision), self.config)
+
+    async def _handle_batch_interrupts(self, interrupts: list) -> None:
+        """批量 interrupt 流程 — N 个工具调用一次预览, 一个决策 prompt.
+
+        ⚠️ HITL middleware 单 interrupt 内 N action_requests 的场景: 实际触发
+        batch 时, interrupts 列表里通常是 1 个 Interrupt (HITL middleware 的
+        after_model 只调一次 interrupt()). 单 Interrupt 内 action_requests 的
+        多个工具调用 → 走单 interrupt 路径内的 _format_hitl_preview 逐个打印.
+        跨 interrupt 多次触发 (e.g. 不同 specialist 同时调用) 才进 batch 路径.
+
+        UX:
+          >>> HITL 批量审批 — 共 3 个工具调用:
+            --- #1/3 ---
+            [write_note] 预览: ...
+            --- #2/3 ---
+            [refund_order] 预览: ...
+            --- #3/3 ---
+            [run_sql] 预览: ...
+
+          决策: [A]pprove all / [R]eject all / [S]elective (per-tool)? a
+        """
+        n = len(interrupts)
+        print(f"\n\n[!]  HITL 批量审批 — 共 {n} 个工具调用:")
+        # 1. 打印每个 interrupt 的预览 (header 标 #i/n 视觉对齐)
+        for i, intr in enumerate(interrupts, 1):
+            print(f"\n--- #{i}/{n} ---")
+            self._print_interrupt_preview(intr)
+
+        # 2. 读单决策 prompt
+        raw_input, eof = self._read_batch_decision()
+
+        # 3. 解析为 decisions list (按 interrupt 顺序对齐)
+        decisions = self._resolve_batch(raw_input, interrupts, eof=eof)
+
+        # 4. Resume graph (走同一份 _stream_and_print 辅助)
+        await self._stream_and_print(
+            Command(resume={"decisions": decisions}),
+            self.config,
+        )
+
+    def _print_interrupt_preview(self, intr) -> None:
+        """打印单个 interrupt 的预览 — 支持 HITL middleware action_requests + 普通 tool_calls.
+
+        优先级:
+          1. value.action_requests (HITL middleware 1.0 格式, list)
+          2. value.tool_calls (自定义 interrupt() 老格式, list)
+          3. value.name + value.args (单工具 dict 格式)
+          4. fallback: 打印 raw value
+        """
+        value = intr.value if hasattr(intr, "value") else intr
+        if not isinstance(value, dict):
+            print(f"  (无预览: {value})")
+            return
+        # 1. HITL middleware: action_requests
+        action_requests = value.get("action_requests")
+        if action_requests:
+            for j, action in enumerate(action_requests, 1):
+                name = action.get("name", "?")
+                args = action.get("args", {})
+                if len(action_requests) > 1:
+                    print(f"  [{j}/{len(action_requests)}] [{name}] 预览:")
+                else:
+                    print(f"  [{name}] 预览:")
+                for line in _format_hitl_preview(name, args):
+                    print(line)
+                if j < len(action_requests):
+                    print()
+            return
+        # 2. 老格式: tool_calls
+        tool_calls = value.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                tname = tc.get("name", "?")
+                targs = tc.get("args", {})
+                print(f"  [{tname}] 预览:")
+                for line in _format_hitl_preview(tname, targs):
+                    print(line)
+                print()
+            return
+        # 3. 单工具 dict 格式
+        if "name" in value:
+            name = value["name"]
+            args = value.get("args", {})
+            print(f"  [{name}] 预览:")
+            for line in _format_hitl_preview(name, args):
+                print(line)
+            return
+        # 4. fallback
+        print(f"  (无预览: {value})")
+
+    def _read_batch_decision(self) -> tuple[str, bool]:
+        """读 batch 主 prompt. Returns (raw_input, eof_flag).
+
+        EOF / Ctrl-C → eof=True (防御性: 默认 reject all).
+        """
+        try:
+            raw = input(
+                "\n决策 [A]pprove all / [R]eject all / [S]elective (per-tool): "
+            ).strip().lower()
+            return (raw, False)
+        except (EOFError, KeyboardInterrupt):
+            return ("", True)
+
+    def _resolve_batch(
+        self, raw: str, interrupts: list, eof: bool = False
+    ) -> list[str]:
+        """解析 batch 决策 → list[str] (按 interrupt 顺序对齐).
+
+        行为:
+          EOF                → ["reject"] * n     (defensive)
+          "" / "a" / "approve" → ["approve"] * n   (默认 approve)
+          "r" / "reject"     → ["reject"] * n
+          "s" / "selective"  → _read_selective_decisions (per-tool sub-prompt)
+          其它 (e.g. "x")    → ["reject"] * n     (default safety)
+
+        ⚠️ 顺序必须严格按 `interrupts` 顺序追加 — middleware 按顺序消费
+        decisions list, 错位会错 approve. _read_selective_decisions 同样按
+        interrupts 顺序迭代, 不打乱.
+        """
+        n = len(interrupts)
+        if eof:
+            print("EOF, 默认 reject all (防御性 — 不留未决决策)")
+            return ["reject"] * n
+        if not raw or raw == "a" or raw == "approve":
+            return ["approve"] * n
+        if raw == "r" or raw == "reject":
+            return ["reject"] * n
+        if raw == "s" or raw == "selective":
+            return self._read_selective_decisions(interrupts)
+        # 无效输入 → 默认 reject all (defensive)
+        print(f"无效输入 {raw!r}, 默认 reject all")
+        return ["reject"] * n
+
+    def _read_selective_decisions(self, interrupts: list) -> list[str]:
+        """Per-tool sub-prompt — 简单格式 `#N tool_name [a/r]:`.
+
+        ⚠️ Selective 模式不可逆: 一旦 approve 一个工具, 不能撤回. 中途 EOF
+        → 剩余全部 reject (defensive, 不留未决决策).
+        """
+        decisions: list[str] = []
+        n = len(interrupts)
+        for i, intr in enumerate(interrupts, 1):
+            name = self._extract_tool_name_from_interrupt(intr)
+            try:
+                raw = input(f"  #{i} {name} [a/r]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                # EOF / Ctrl-C 中途 → 剩余全部 reject (defensive)
+                print(
+                    f"\n  EOF, #{i}-{n} 自动 reject (防御性 — 不留未决决策)"
+                )
+                decisions.extend(["reject"] * (n - i + 1))
+                return decisions
+            if not raw or raw.startswith("a"):
+                decisions.append("approve")
+            else:
+                decisions.append("reject")
+        return decisions
+
+    def _extract_tool_name_from_interrupt(self, intr) -> str:
+        """从 interrupt 提取工具名 (用于 selective mode 显示).
+
+        优先级同 _print_interrupt_preview:
+          action_requests > tool_calls > name
+        """
+        value = intr.value if hasattr(intr, "value") else intr
+        if isinstance(value, dict):
+            action_requests = value.get("action_requests")
+            if action_requests:
+                names = [a.get("name", "?") for a in action_requests]
+                return ",".join(names) if len(names) > 1 else names[0]
+            tool_calls = value.get("tool_calls")
+            if tool_calls:
+                names = [tc.get("name", "?") for tc in tool_calls]
+                return ",".join(names) if len(names) > 1 else names[0]
+            if "name" in value:
+                return str(value["name"])
+        return "?"
 
 
 # WELCOME / HELP_TEXT 不是 CLI 的 API, 但保留在 __all__ 方便单元测试 import 断言内容.
