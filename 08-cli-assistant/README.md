@@ -43,6 +43,15 @@ python main.py
 > ⚠️ Shell 全局 `export ANTHROPIC_API_KEY=xxx` 会让 `.env` 改动失效。
 > 临时绕过: `env -u ANTHROPIC_API_KEY python main.py`。
 
+## 📋 最终状态
+
+7 批深度优先后, 项目进入稳定状态. 完整收尾文档见 [STATUS.md](STATUS.md):
+- 能力矩阵 (13 维度 / 9 工具 / 5 specialist / 11 命令)
+- 12 验证场景 + 验证状态
+- 7 批深度优先总结 + 关键设计
+- 已知限制 (生产 gap) + 升级路径
+- AST smoke 验证 9/9 OK
+
 ## Notes 持久化 (JSONL)
 
 `NotesAgent` 工具持久化到 `08-cli-assistant/data/notes.jsonl` — 写笔记不丢, 重启后还在.
