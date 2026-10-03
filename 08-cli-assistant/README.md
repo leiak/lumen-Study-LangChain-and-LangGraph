@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · HITL batch preview OK (single/multi/selective/EOF) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful) · /diff OK (forward/backward/empty/invalid index/same/non-int)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · HITL batch preview OK (single/multi/selective/EOF) · HITL edit OK (single / action_requests+tool_calls+name+args 抽取 / 4 类型 / empty / invalid key / EOF / Ctrl-C / multi-key / bool coerce) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful) · /diff OK (forward/backward/empty/invalid index/same/non-int)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -237,13 +237,16 @@ LLM 看到的 SQL 执行, 在 retry 层是不透明的 — 只有当 retry 全�
 | 10 | `哪个商品卖得最好` (DataAgent 复杂查询) | 调 `list_tables` → `describe_table order_items` → `run_sql SELECT product, SUM(quantity)... GROUP BY product ORDER BY SUM(quantity) DESC LIMIT 1`, HITL 通过 |
 | 11 | 跑 3 轮对话 → `/history` → `/diff 1 3` | 列出 1→3 之间新增 message + token delta + latency delta (只读) |
 | 12 | "查所有用户并退款 #123 50元" | 触发 multi-tool: run_sql + refund_order → HITL batch 审批 (`[A]`/`[R]`/`[S]` 单 prompt) |
+| 13 | "退款 #123 200元" | 触发 HITL → 输入 `e` → 改 `amount=50` → `a` → 实际退款 50 元 (而不是 LLM 提的 200) |
 
 ### HITL 决策细节
 
-CLI 只暴露 `[a]pprove` / `[r]eject` 两种 — 没有 `[e]dit`。
-原因: LangGraph 协议层仍支持 `["approve","edit","reject"]` 三种, 但 `edit`
-常被误按成 `approve`, UX 上直接砍掉。
+CLI 单 interrupt 暴露 `[a]pprove` / `[e]dit` / `[r]eject` 三种 (v9 批新增 `[e]dit`)。
+批量 (multi-interrupt) 仍是 `[A]pprove all / [R]eject all / [S]elective` 三选一 — 不加 `[E]dit`
+(选择性 edit 太复杂, YAGNI)。
 `r` 之后会追问 "拒绝原因", 拼到 `{"type":"reject","reason":...}` 里回传。
+`a` 空提交也算 approve (REPL 单字符 prompt 习惯)。
+详见 [HITL 参数编辑 (`[e]dit` v9)](#hitl-参数编辑-edit-v9) 节。
 
 ### HITL 影响预览
 
@@ -264,6 +267,87 @@ approve 前 REPL 会先打印"将要发生什么" — 不盲签。
 ⚠️ **EXPLAIN + LIMIT**: `_audit_sql` 会给 SELECT 自动追加 `LIMIT 1000`, 所以
 `EXPLAIN SELECT * FROM users` 实际跑的是 `EXPLAIN SELECT * FROM users LIMIT 1000`
 (MySQL 完全支持 EXPLAIN + LIMIT, 语法合法)。
+
+### HITL 参数编辑 (`[e]dit` v9)
+
+LangGraph 协议层一直支持 `["approve", "edit", "reject"]` 三种 decision, 但
+CLI 早期只暴露了 approve / reject (怕误按) — v9 批加回 `[e]dit`, 闭合 HITL UX
+闭环: 用户可以"approve 但改参数", 不必整轮 reject + 重新发请求。
+
+**触发条件**: 只在单 interrupt (R7 批量仍 A/R/S, YAGNI)。批量场景要 `[e]dit`,
+selective 模式逐个 edit 太碎; 用户用 `[S]` selective reject 单个, 再发一句修正版。
+
+**UX** (举例 `退款 #123 200元`):
+
+```
+>>> HITL 中断 (节点 ...):
+  ...
+
+决策 [a]pprove / [e]dit / [r]eject: e
+
+--- 当前参数 (tool: refund_order) ---
+  order_id: '#123'
+  amount: 200.0
+
+输入新参数 (key=value 空格分隔, 空提交 = 不修改, Ctrl-C 取消):
+> amount=50
+
+# 实际退款 50 元 (而不是 LLM 提的 200 元)
+```
+
+**协议层格式** — LangGraph `HumanInTheLoopMiddleware._process_decision` 接受:
+
+```python
+decision = {
+    "decisions": [{
+        "type": "edit",
+        "edited_action": {
+            "name": tool_name,    # 可也改名 — 中间件允许
+            "args": new_args,     # 新 args dict
+        }
+    }]
+}
+# resume → Command(resume=decision)
+```
+
+`_verify_edit_format.py` 已验证: middleware 接受此格式, 返回新 `ToolCall`
+保留原 `id`, 改名也行。生产用 LangChain 1.0.2 + langgraph 1.0 验证通过。
+
+**类型自动 coerce** (`_coerce_value`):
+
+| 字段当前类型 | 输入 "42" | 结果 |
+|---|---|---|
+| `int` | `int("42")` | `42` |
+| `float` | `float("3.14")` | `3.14` |
+| `str` | 保持 `"42"` | `"42"` |
+| `bool` | `"true"/"1"/"yes" → True`, 其它 → False | `True` |
+| coerce 失败 (e.g. `int("hello")`) | fallback 当 str | `"hello"` |
+
+⚠️ **bool 在 int 前判** — Python quirk: `type(True) is int` 也成立 (`bool` 是 `int` 子类),
+不判顺序会被 `int("True")` 报错。
+
+**shlex 拆 token** — 支持引号: `note="hello world"` 拆成 1 个 token。
+
+**边界处理**:
+
+| 输入 | 行为 |
+|---|---|
+| 空 input | 返 `dict(current)` — 无修改, caller 后续转 approve |
+| `key=value` 中 `key` 不在当前参数 | skip + 警告 (防 typo / 增 key 破坏 signature) |
+| 多 token 空格分隔 | `shlex.split` 拆 N 个, 依次处理 |
+| `EOF` / `Ctrl-C` 在 edit prompt | 返 None → caller fallback reject (防御性) |
+| 无 args (`{...}` 空) | 打印 "(无参数)", 用户可空提交直接 approve |
+| 未知 decision (e.g. `x`) | 默认 reject (现有行为, 不动) |
+
+**实现** (`cli.py`):
+- `_extract_tool_args_from_interrupt(intr)` — 4 种 interrupt value 格式兼容
+  (`action_requests[0]` / `tool_calls[0]` / `value["args"]` / `{}` fallback)
+- `_prompt_edit_args(tool_name, current)` — 交互式 REPL, shlex 拆 + 类型 coerce
+- `_coerce_value(raw, target_type)` — 模块级 helper, 4 类型
+- `_handle_single_interrupt` — `[e]dit` 分支调上述, 拼 `EditDecision` 发 resume
+
+**向后兼容**: approve / reject (without edit) 路径完全不变; `[e]dit` 是纯
+additive, 用户不输入 `e` 走原路径。空提交也算 approve。
 
 ### HITL 批量审批 (multi-interrupt 单决策 prompt)
 
@@ -593,8 +677,10 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
    `env -u ANTHROPIC_API_KEY python main.py`。
 8. **Rewind 一次性** — 跑完一个 turn 就清掉 `_rewind_ckpt`, 不然会一直
    time-travel 在那个分支上, 后续 `/history` 也只看 rewound 之后的子集。
-9. **HITL 协议层有 3 种 decision, CLI 只暴露 2 种** — `edit` 在协议层支持,
-   但 UX 上常被误按成 `approve`, CLI 直接砍掉。
+9. **HITL 协议层有 3 种 decision, v9 起 CLI 单 interrupt 全暴露** — `edit` 在 v9
+   批加入 (`[a]pprove / [e]dit / [r]eject`)。批量 (multi-interrupt) 仍只有
+   `[A]pprove all / [R]eject all / [S]elective` — 不加 `[E]dit`, YAGNI (per-tool
+   edit 提示太长, 用户用 `[S]` selective reject 单项 + 重发更直接)。
 10. **`InMemoryStore` 重启即丢** — 演示用够, 生产换 `PostgresStore.from_conn_string(...)`。
 11. **`usage_metadata` 部分 provider 不返回 (e.g. MiniMax M3 内测)** — token 显示 0
     但 cost 仍算 (M3 在 pricing 表里 cost=0, 所以没影响); 其它未接 pricing 的模型
@@ -654,6 +740,18 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
     middleware 按顺序消费 decisions list (跟 `interrupt_tool_calls` 一一对应),
     错位会错 approve — e.g. 用户想 approve write_note 但 reject refund,
     selective sub-prompt 必须按 #1 #2 #3 顺序输入, 不能跳。
+25. **`[e]dit` 仅支持单 interrupt (HITL v9)** — 批量模式 (R7) 不暴露
+    `[E]dit all` / `[E]dit selective`, YAGNI。批量要"改某个工具的参数",
+    selective reject 单项 + 重发整轮更清晰。CLI 提示给单 batch prompt, 不报错。
+26. **LangGraph 版本依赖 (`[e]dit` 协议)** — `EditDecision` 协议 (字段名
+    `type` / `edited_action`) 跟 LangChain / LangGraph 版本绑定。当前
+    验证版本: `langchain==1.0.2` + `langgraph==1.0.x` (即 `_verify_edit_format.py`
+    用 `HumanInTheLoopMiddleware._process_decision` 喂 mock 决策通过)。版本
+    升级后需重跑该脚本 (若格式变, 改 `_apply_hitl_edit_decision` + README)。
+27. **类型推断限制 (`[e]dit` coerce)** — `_coerce_value` 只覆盖 `int / float /
+    str / bool` 4 类; 嵌套结构 (e.g. `{"filters": [...]}`) / Pydantic model /
+    enum 都 fallback 当 str 塞。LLM/工具发现类型不对, 报错给用户看 — 用户
+    可拒绝重发。复杂参数类型支持是 YAGNI (HITL 工具 args 实际都是 scalar)。
 
 ## 复用项目内 demo
 

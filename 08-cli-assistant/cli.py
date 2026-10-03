@@ -200,6 +200,27 @@ def _print_msg_line(msg, prefix: str) -> None:
     print(f"  {prefix}{type_name}{name_part}: {preview!r}")
 
 
+def _coerce_value(raw: str, target_type: type) -> object:
+    """类型转换: 跟 target_type 对齐. 失败 raise ValueError.
+
+    HITL [e]dit 用: 用户在 stdin 输 "amount=50", 但当前 args["amount"] 是 float
+    → 这里按 target_type 强转. 不支持 list / dict / 自定义类 — 保持 raw str.
+
+    ⚠️ bool 是 int 子类, type(True) is int 也成立 (Python quirk), 所以 bool
+    要在 int 前面判. 不然 True/False 会被 int("True") 报错.
+    """
+    if target_type is bool:
+        return raw.lower() in ("true", "1", "yes")
+    if target_type is int:
+        return int(raw)
+    if target_type is float:
+        return float(raw)
+    if target_type is str:
+        return raw
+    # 其它类型 (list / dict / BaseModel) — fallback string, 让 LLM 后续校验
+    return raw
+
+
 # ============================================================
 # 欢迎语 + 帮助
 # ============================================================
@@ -701,12 +722,22 @@ class CLI:
             await self._handle_batch_interrupts(interrupts)
 
     async def _handle_single_interrupt(self, intr) -> None:
-        """单 interrupt 流程 — 现有 UX 保留, 不变.
+        """单 interrupt 流程 — `[a]pprove / [e]dit / [r]eject` 三选一.
 
-        prompt 风格保持 `[a]pprove / [r]eject` 不变 (向后兼容).
+        v9 (R8 批): 加 `[e]dit` 选项. 用户可改 args 后再 approve.
+        LangGraph 协议层一直支持 edit; 现在 CLI 也暴露.
+
+        行为:
+          a (空/approve) → approve (现有路径不变)
+          e (edit)       → 交互式改 args, 改完发 edit decision
+                          (EOF/Ctrl-C 取消 → fallback reject)
+          r (reject)     → reject + 追问 reason (现有路径不变)
+          其它           → 默认 reject (defensive)
         """
         state = self.graph.get_state(self.config)
         intr_value = intr.value if hasattr(intr, "value") else intr
+        tool_name = self._extract_tool_name_from_interrupt(intr)
+        current_args = self._extract_tool_args_from_interrupt(intr)
         print(f"\n\n[!]  HITL 中断 (节点 {state.next}):")
         # intr 是 dict, 包含 tool_call / reason
         if isinstance(intr_value, dict):
@@ -728,17 +759,35 @@ class CLI:
         else:
             print(f"  {intr_value}")
 
-        # 读决策 — 只暴露 approve / reject 给用户.
-        # LangGraph 协议层仍允许 ["approve","edit","reject"] 三种 type, 但 CLI 不提供 edit:
-        # 实战中 [e]dit 经常被误按成 approve, UX 上直接砍掉.
+        # 读决策 — v9 加 [e]dit.
         try:
-            decision_raw = input("\n决策 [a]pprove / [r]eject: ").strip().lower()
+            decision_raw = input(
+                "\n决策 [a]pprove / [e]dit / [r]eject: "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\n已取消")
             return
 
-        if decision_raw.startswith("a"):
+        if decision_raw.startswith("a") or decision_raw == "":
+            # ⭐ 空提交也算 approve — REPL 单字符 prompt 习惯
             decision = {"decisions": [{"type": "approve"}]}
+        elif decision_raw.startswith("e"):
+            # ⭐ edit: 调 _prompt_edit_args 拿新 args (None = 取消 → reject)
+            new_args = self._prompt_edit_args(tool_name, current_args)
+            if new_args is None:
+                print(">>> edit 取消, 转为 reject")
+                reason = input("拒绝原因 (默认: edit 取消): ").strip() or "edit 取消"
+                decision = {"decisions": [{"type": "reject", "reason": reason}]}
+            else:
+                # LangGraph 1.x EditDecision 协议:
+                #   {"type": "edit", "edited_action": {"name": ..., "args": ...}}
+                # 已用 _verify_edit_format.py 验证 middleware._process_decision 接受此格式
+                decision = {
+                    "decisions": [{
+                        "type": "edit",
+                        "edited_action": {"name": tool_name, "args": new_args},
+                    }]
+                }
         elif decision_raw.startswith("r"):
             reason = input("拒绝原因: ").strip()
             decision = {"decisions": [{"type": "reject", "reason": reason}]}
@@ -748,6 +797,88 @@ class CLI:
 
         # resume - 走同一份 _stream_and_print 辅助
         await self._stream_and_print(Command(resume=decision), self.config)
+
+    def _extract_tool_args_from_interrupt(self, intr) -> dict:
+        """从 interrupt value 抽当前工具调用的 args (用于 [e]dit).
+
+        兼容 4 种格式 (跟 _print_interrupt_preview 一致):
+          1. action_requests[0].args (HITL middleware 1.0 格式)
+          2. tool_calls[0].args       (老 interrupt() 格式)
+          3. value 直接是 {name, args}(单工具 dict)
+          4. fallback: {} (无 args, [e]dit 会显示 "(无参数)")
+        """
+        value = intr.value if hasattr(intr, "value") else intr
+        if not isinstance(value, dict):
+            return {}
+        action_requests = value.get("action_requests")
+        if action_requests:
+            return dict(action_requests[0].get("args", {}))
+        tool_calls = value.get("tool_calls")
+        if tool_calls:
+            return dict(tool_calls[0].get("args", {}))
+        if "args" in value:
+            return dict(value["args"])
+        return {}
+
+    def _prompt_edit_args(self, tool_name: str, current: dict) -> dict | None:
+        """交互式编辑 HITL 参数. 返回新 dict 或 None (取消).
+
+        UX (9 批设计):
+          --- 当前参数 (tool: refund_order) ---
+            order_id: '#123'
+            amount: 100.0
+
+          输入新参数 (key=value 空格分隔, 空提交 = 不修改, Ctrl-C 取消):
+          > amount=50
+
+        解析: shlex 拆 tokens, 支持 'note="hello world"' 引号.
+        类型: 按当前值 type(int/float/str/bool) 自动 coerce; coerce 失败 fallback str.
+        未知 key: skip + warning (防 typo).
+        EOF / Ctrl-C: 返 None → caller 走 reject fallback.
+        空 input: 返 dict(current) — 无修改 (后续 approve).
+        """
+        print(f"\n--- 当前参数 (tool: {tool_name}) ---")
+        if not current:
+            print("  (无参数)")
+        else:
+            for k, v in current.items():
+                print(f"  {k}: {v!r}")
+        print()
+        print("输入新参数 (key=value 空格分隔, 空提交 = 不修改, Ctrl-C 取消):")
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not line:
+            return dict(current)  # 无修改 — caller 后续转 approve
+
+        import shlex
+        try:
+            tokens = shlex.split(line)
+        except ValueError as e:
+            print(f">>> 解析失败: {e}, 保持原参数")
+            return dict(current)
+
+        new = dict(current)
+        for tok in tokens:
+            if "=" not in tok:
+                print(f">>> 跳过非 key=value token: {tok!r}")
+                continue
+            k, _, v = tok.partition("=")
+            k = k.strip()
+            if k not in current:
+                # 防 typo / 增新 key — current 里没的 key 不接受
+                # (增新 key 会破坏 tool signature, 让 LLM 重发更稳)
+                print(f">>> 警告: key {k!r} 不在当前参数里, 跳过")
+                continue
+            try:
+                new[k] = _coerce_value(v, type(current[k]))
+            except ValueError:
+                # coerce 失败 → 当字符串塞, LLM/tool 报错用户能看见
+                new[k] = v
+                print(f">>> 警告: {k}={v} 不能转 {type(current[k]).__name__}, 当 str 处理")
+        return new
 
     async def _handle_batch_interrupts(self, interrupts: list) -> None:
         """批量 interrupt 流程 — N 个工具调用一次预览, 一个决策 prompt.
