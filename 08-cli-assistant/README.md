@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful) · /diff OK (forward/backward/empty/invalid index/same/non-int)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · HITL batch preview OK (single/multi/selective/EOF) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful) · /diff OK (forward/backward/empty/invalid index/same/non-int)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -227,6 +227,7 @@ LLM 看到的 SQL 执行, 在 retry 层是不透明的 — 只有当 retry 全�
 | 9 | `北京有几个用户` (DataAgent) | 调 `list_tables` → `describe_table users` → `run_sql SELECT COUNT(*) ... WHERE city='北京'`, 触发 HITL 输入 `a` 通过, 返回 `1` |
 | 10 | `哪个商品卖得最好` (DataAgent 复杂查询) | 调 `list_tables` → `describe_table order_items` → `run_sql SELECT product, SUM(quantity)... GROUP BY product ORDER BY SUM(quantity) DESC LIMIT 1`, HITL 通过 |
 | 11 | 跑 3 轮对话 → `/history` → `/diff 1 3` | 列出 1→3 之间新增 message + token delta + latency delta (只读) |
+| 12 | "查所有用户并退款 #123 50元" | 触发 multi-tool: run_sql + refund_order → HITL batch 审批 (`[A]`/`[R]`/`[S]` 单 prompt) |
 
 ### HITL 决策细节
 
@@ -254,6 +255,73 @@ approve 前 REPL 会先打印"将要发生什么" — 不盲签。
 ⚠️ **EXPLAIN + LIMIT**: `_audit_sql` 会给 SELECT 自动追加 `LIMIT 1000`, 所以
 `EXPLAIN SELECT * FROM users` 实际跑的是 `EXPLAIN SELECT * FROM users LIMIT 1000`
 (MySQL 完全支持 EXPLAIN + LIMIT, 语法合法)。
+
+### HITL 批量审批 (multi-interrupt 单决策 prompt)
+
+当一次 LLM turn 触发多个 HITL 工具 (例如一个 AIMessage 同时含
+`write_note + refund_order`, 或 DataAgent 多次 `run_sql` 调用),
+默认流程会一次问 N 次 `a/r`, 用户体验割裂。批量模式把 N 个 preview
+合并到一次 prompt:
+
+```
+[!]  HITL 批量审批 — 共 3 个工具调用:
+
+--- #1/3 ---
+  [1/2] [write_note] 预览:
+  name: shopping
+  content (60 字符): aaaa...
+
+  [2/2] [refund_order] 预览:
+  订单: #123
+  当前金额: ¥199.00 (LangChain 课程)
+  退款: ¥100.00
+  退款后余额: ¥99.00
+
+--- #2/3 ---
+  [run_sql] 预览:
+  SQL: SELECT * FROM users WHERE city = '北京'
+  预估影响行数: ~5 (EXPLAIN 估算)
+
+--- #3/3 ---
+  [run_sql] 预览:
+  SQL: SELECT COUNT(*) FROM orders
+  预估影响行数: ~6 (EXPLAIN 估算)
+
+决策 [A]pprove all / [R]eject all / [S]elective (per-tool): a
+```
+
+**3 种决策模式**:
+
+| 输入 | 行为 |
+|---|---|
+| `[A]` / `approve` / Enter (空) | 全部 approve |
+| `[R]` / `reject` | 全部 reject |
+| `[S]` / `selective` | 进 per-tool sub-prompt (`#N tool_name [a/r]:`) |
+| 其它 (e.g. `x`) | 默认 reject all (defensive) |
+| EOF / Ctrl-C | reject all (defensive) |
+
+**触发条件**: `len(state.tasks[0].interrupts) > 1`. 单 interrupt 走原路径
+(UX 不变, `[a]pprove / [r]eject` prompt 风格保留 — 向后兼容)。
+
+**实现** (`cli.py`):
+- `_maybe_hitl(interrupts)` — 顶层调度, 单 vs batch
+- `_handle_batch_interrupts(interrupts)` — N previews + 单 prompt
+- `_print_interrupt_preview(intr)` — 4 种 value 格式兼容 (HITL middleware
+  `action_requests` / 老 `tool_calls` / 单 `name+args` / fallback)
+- `_resolve_batch(raw, interrupts, eof)` — 解析决策
+- `_read_selective_decisions(interrupts)` — per-tool sub-prompt
+- `_extract_tool_name_from_interrupt(intr)` — selective 显示用
+
+**典型触发场景**:
+- LLM 在一个 AIMessage 同时发 2+ 危险工具 (e.g. `write_note + refund_order`,
+  或 DataAgent 多次 `run_sql`)
+- 跨 specialist 一次性 batch (理论可能: supervisor 路由到单 specialist,
+  但其 LLM 调了多个 HITL 工具)
+- 用户用一句话发多个请求 (e.g. "查北京用户 + 退款 #123 50元" — 视模型决定
+  是否分 specialist; 多 single HITL 也可能触发 batch)
+
+**向后兼容**: 单 interrupt UX 完全不变 (`[!] HITL 中断 (节点 ...)` 标题 +
+`[a]pprove / [r]eject` prompt)。只在 `len(interrupts) > 1` 时切 batch 路径。
 
 ### PII 脱敏细节
 
@@ -563,6 +631,20 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
     checkpoint replay 偶有同一 message 多副本 (supervisor 转回 / 中断 retry)。
     `extract_tokens` 按 `message.id` 去重, `/diff` 两边都走同一函数, 所以
     delta 数学稳。但 ±5% 误差可接受 — 不要拿这个数当精确 cost 预测。
+22. **Selective mode 不可逆 (HITL batch)** — `_read_selective_decisions` 一旦
+    用户输入 `a`, 该工具立即被加进 decisions 列表, 不能撤回。中途 EOF /
+    Ctrl-C → 剩余工具全部 reject (defensive, 不留未决决策)。
+23. **混合 dangerous + safe 工具 batch (HITL batch)** — `HumanInTheLoopMiddleware`
+    只在 `_HITL_INTERRUPT_ON` 字典里的工具触发 interrupt, 安全工具
+    (`list_tables` / `describe_table` / `read_note` / `get_order` /
+    `get_weather` / `calc`) 自动 approve。batch 列表只会含 dangerous 工具,
+    不会出现"5 个 safe 工具挤在 batch 里"的 UX。LLM 在一个 AIMessage 同时
+    调 safe + dangerous 时, safe 直接执行, dangerous 走 HITL。
+24. **每工具 decision 顺序必须对齐 interrupt_on (HITL batch)** —
+    `_resolve_batch` 严格按 `interrupts` 列表顺序追加 decisions, 不打乱。
+    middleware 按顺序消费 decisions list (跟 `interrupt_tool_calls` 一一对应),
+    错位会错 approve — e.g. 用户想 approve write_note 但 reject refund,
+    selective sub-prompt 必须按 #1 #2 #3 顺序输入, 不能跳。
 
 ## 复用项目内 demo
 
