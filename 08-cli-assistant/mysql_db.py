@@ -9,10 +9,12 @@
 公开 API:
   - build_engine()          -> Engine (缺 env 时 raise RuntimeError)
   - get_schema_summary(engine) -> (tables: list[str], describe: dict[str, str])
-  - execute_safe_select(engine, sql) -> (text: str, rows: list[dict])
+  - execute_safe_select(engine, sql) -> (text: str, row_count: int)
 
 内部:
   - _audit_sql(sql: str) -> str  # 清洗/校验 SQL; 不合法 raise ValueError
+  - _TRANSIENT_MYSQL_CODES (frozenset) — 仅这些 errno 自动重试
+  - _extract_errno(exc) -> int | None  # 从 SQLAlchemy 异常链挖 errno
 
 跑法:
     1. .env 加  MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
@@ -336,53 +338,140 @@ def _audit_sql(sql: str) -> str:
 
 
 # ============================================================
+# Transient 错误重试 — 仅对 lock / 连接类错误 retry, 其它透传
+# ============================================================
+# MySQL errno 集合 (pymysql 报 errno 是 int, sqlalchemy 包装在 .orig.args[0]).
+# 区分原则: transient = "下次可能成功", permanent = "下次还失败".
+#   - 1205 (Lock wait timeout) — 其它事务持锁, 等一下能拿到
+#   - 1213 (Deadlock)           — MySQL 已回滚, 重试代价小
+#   - 2003/2006/2013            — 网络/连接断开, 重连后能恢复
+#   - 1040 (Too many connections) — 池子挤爆, 等别的连接释放
+# 永久错 (1146/1054/1052/1064/1364) 失败是确定的, 重试只是浪费 7s.
+_TRANSIENT_MYSQL_CODES = frozenset({
+    1205,  # ER_LOCK_WAIT_TIMEOUT
+    1213,  # ER_LOCK_DEADLOCK
+    2003,  # CR_CONN_HOST_ERROR
+    2006,  # CR_SERVER_GONE_ERROR
+    2013,  # CR_SERVER_LOST
+    1040,  # ER_CON_COUNT_ERROR
+})
+
+
+def _extract_errno(exc: Exception) -> int | None:
+    """从 SQLAlchemy 异常链里提取 MySQL errno.
+
+    SQLAlchemy 包 SQLAlchemyError 里 .orig 是 pymysql.err.OperationalError,
+    .orig.args[0] 是 int errno. 嵌套时可能 .orig.orig (实际 1-2 层足够,
+    5 层防极端情况).
+
+    Returns:
+        errno int 或 None (非 MySQL 异常 / 拿不到 errno).
+    """
+    cur = exc
+    for _ in range(5):  # 防无限链
+        orig = getattr(cur, "orig", None)
+        if orig is None:
+            break
+        args = getattr(orig, "args", ())
+        if args and isinstance(args[0], int):
+            return args[0]
+        cur = orig
+    # 顶层 errno (某些 sqlalchemy 版本直接挂)
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+# ============================================================
 # 执行 + 格式化结果
 # ============================================================
 _MAX_DISPLAY_ROWS = 50  # 给 LLM/用户看的前 N 行
 _QUERY_TIMEOUT_SEC = 10.0  # C2: 真实查询超时 (client-side kill via ThreadPoolExecutor)
+# R5: transient retry 上限 — initial + 2 retries = 3 attempts
+# backoff 在 attempt 前: 第 2 次前 1s, 第 3 次前 2s (max 3s 总等待)
+_MAX_RETRY_ATTEMPTS = 3
 
 
-def execute_safe_select(engine: Engine, sql: str) -> tuple[str, list[dict[str, Any]]]:
-    """执行 SQL, 返回 (markdown_table_text, rows_list).
+def execute_safe_select(
+    engine: Engine,
+    sql: str,
+    *,
+    max_attempts: int = _MAX_RETRY_ATTEMPTS,
+) -> tuple[str, int]:
+    """执行 SQL, 返回 (markdown_table_text, row_count).
 
     text 是 markdown 表格 (前 _MAX_DISPLAY_ROWS 行 + 行数统计);
-    rows_list 是原始 dict 列表 (供后续 expand 用, demo 里 LLM 只看 text).
+    row_count 是原始行数 (int).
 
     异常:
-      ValueError — _audit_sql 拒绝 (抛到 tool, 转成 ToolMessage)
-      sqlalchemy.exc.* — DB 错误 (语法/超时/连接断, 抛到 tool)
+      ValueError  — _audit_sql 拒绝 (立即 raise, **不重试** — 永久错)
+      sqlalchemy.exc.OperationalError / DatabaseError with transient errno —
+        自动重试 max_attempts 次 (默认 3), backoff 1s/2s
+      其它 Exception — 立即 raise (供 _enrich_error 处理)
+
+    Retry 策略 (R5 transient retry):
+      - 仅对 _TRANSIENT_MYSQL_CODES (1205/1213/2003/2006/2013/1040) 重试
+      - audit 失败 (ValueError) 不进重试 — 永久
+      - 永久 SQL 错 (1146/1054/1052/1064/1364) 不进重试 — 失败是确定的
+      - 通用 Exception 不进重试 — 不知道是否 transient, 透传 _enrich_error
+      - backoff: 第 2 次前 sleep 1s, 第 3 次前 sleep 2s (max 3s 总等待)
+      - audit 只在 retry loop 前跑 1 次 — 同一 SQL 多次试
+      - markdown 格式化在 retry loop 外 — 失败时 raise 给 tools.py enrich
+      - 查询超时 (ThreadPoolExecutor TimeoutError) 不重试 — 下次大概率还慢
 
     C2: 走 ThreadPoolExecutor 实现真实 client-side 10s 超时.
     ⚠️ 注意: 这是 client-side kill (force-close 连接), 不是 server-side cancel.
     真正的 server-side timeout 需要 MySQL 配合
     `SET SESSION MAX_EXECUTION_TIME = 10000` (毫秒), 生产应开启.
     """
-    safe_sql = _audit_sql(sql)  # 不合法 raise ValueError
+    safe_sql = _audit_sql(sql)  # 永久失败立即 raise, 不进 retry loop
 
-    def _run() -> tuple[list[str], list[dict[str, Any]]]:
+    last_exc: Exception | None = None
+    cols: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    def _run() -> None:
         with engine.connect() as conn:
             result = conn.execute(text(safe_sql))
-            columns = list(result.keys())
-            rows = [dict(zip(columns, row)) for row in result.fetchall()]
-            return columns, rows
+            nonlocal cols, rows
+            rows_raw = result.fetchall()
+            cols = list(result.keys()) if result.returns_rows else []
+            rows[:] = [dict(zip(cols, r)) for r in rows_raw]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(_run)
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            # backoff: 1s, 2s, 4s — 仅第 2/3 次前 sleep
+            time.sleep(2 ** (attempt - 1))
         try:
-            columns, rows = future.result(timeout=_QUERY_TIMEOUT_SEC)
-        except concurrent.futures.TimeoutError:
-            # 强制取消 (ThreadPoolExecutor 子线程仍持有, GC 时回收).
-            # pymysql 在 result 取消时, 下次网络读会抛 OperationalError; 下次
-            # connect 时 pool_pre_ping 会发 SELECT 1 探活, 失败就重连.
-            return (
-                f"[查询超时] 超过 {_QUERY_TIMEOUT_SEC}s 已中止 "
-                f"(用更窄的 WHERE / 加索引 / 拆 subquery)",
-                [],
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_run)
+                try:
+                    future.result(timeout=_QUERY_TIMEOUT_SEC)
+                except concurrent.futures.TimeoutError:
+                    # 查询超时: 不属于 transient (下次大概率还慢), 直接 return
+                    return (
+                        f"[查询超时] 超过 {_QUERY_TIMEOUT_SEC}s 已中止 "
+                        f"(用更窄的 WHERE / 加索引 / 拆 subquery)",
+                        0,
+                    )
+            last_exc = None
+            break  # 成功 — 跳出 retry loop 去格式化
+        except Exception as e:
+            errno = _extract_errno(e)
+            # 仅对 transient errno 重试, 且不是最后一次
+            if errno in _TRANSIENT_MYSQL_CODES and attempt < max_attempts - 1:
+                last_exc = e
+                continue
+            raise  # 永久错 / 非 MySQL / 最后一次失败 → raise 给 _enrich_error
 
-    # 格式化: markdown 表格
-    text_md = _format_as_markdown(columns, rows)
-    return text_md, rows
+    if last_exc is not None:
+        # 3 次都 transient 失败 — raise 最后一次 (供 _enrich_error 处理)
+        raise last_exc
+
+    # 成功路径: 格式化 markdown (在 retry loop 外)
+    text_md = _format_as_markdown(cols, rows)
+    return text_md, len(rows)
 
 
 def _format_as_markdown(columns: list[str], rows: list[dict[str, Any]]) -> str:
@@ -542,4 +631,6 @@ __all__ = [
     "_audit_sql",
     "_enrich_error",
     "_extract_columns_from_describe",
+    "_TRANSIENT_MYSQL_CODES",
+    "_extract_errno",
 ]
