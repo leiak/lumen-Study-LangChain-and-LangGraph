@@ -747,7 +747,7 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
     `type` / `edited_action`) 跟 LangChain / LangGraph 版本绑定。当前
     验证版本: `langchain==1.0.2` + `langgraph==1.0.x` (即 `_verify_edit_format.py`
     用 `HumanInTheLoopMiddleware._process_decision` 喂 mock 决策通过)。版本
-    升级后需重跑该脚本 (若格式变, 改 `_apply_hitl_edit_decision` + README)。
+    升级后需重跑该脚本 (若格式变, 改 `_handle_single_interrupt` edit branch + README)。
 27. **类型推断限制 (`[e]dit` coerce)** — `_coerce_value` 只覆盖 `int / float /
     str / bool` 4 类; 嵌套结构 (e.g. `{"filters": [...]}`) / Pydantic model /
     enum 都 fallback 当 str 塞。LLM/工具发现类型不对, 报错给用户看 — 用户
