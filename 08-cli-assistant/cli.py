@@ -10,12 +10,13 @@ REPL 流程:
   7. ⭐ 每个 turn 完成后打印 per-turn 指标 (latency/tokens/tools/specialist/cost)
 
 命令:
-  /history   列出 checkpoints
-  /rewind N  回到第 N 个 checkpoint (不重跑 LLM)
-  /fork TXT  在新 thread 续走, 注入 TXT 作为新的人类消息
-  /memory    查看/编辑长期偏好
-  /stats     Session 累计指标 (turns / tokens / latency / 路由 / cost)
-  /help      帮助
+  /history      列出 checkpoints
+  /diff A B     比较两个 checkpoint 差异 (message + tokens + latency)
+  /rewind N     回到第 N 个 checkpoint (不重跑 LLM)
+  /fork TXT     在新 thread 续走, 注入 TXT 作为新的人类消息
+  /memory       查看/编辑长期偏好
+  /stats        Session 累计指标 (turns / tokens / latency / 路由 / cost)
+  /help         帮助
   /quit, /exit  退出
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ import asyncio
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -160,6 +162,45 @@ def _format_hitl_preview(tool_name: str, args: dict) -> list[str]:
 
 
 # ============================================================
+# /diff 辅助 — 时间戳解析 + message 摘要打印
+# ============================================================
+def _parse_iso_ms(iso_str: str | None) -> int:
+    """ISO 8601 时间戳 → 毫秒 (since epoch). 失败 / None → 0.
+
+    LangGraph 的 StateSnapshot.created_at 是 ISO 8601 字符串 (含 timezone offset).
+    Python 3.11+ `fromisoformat` 直接吃 "+HH:MM" 偏移, 但 "Z" 后缀不认 —
+    这里手动 replace. 失败 defensive 返回 0, 不阻塞 diff 计算.
+    """
+    if not iso_str:
+        return 0
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _print_msg_line(msg, prefix: str) -> None:
+    """打印一行 message 摘要: 类型 + (optional name) + 前 50 字符 content.
+
+    用在 /diff 输出里, 把 added/removed message 一行一颗塞进去.
+    name 仅当存在时打印 (e.g. AIMessage(name="WeatherAgent")).
+    content 是 list 时 (tool_calls 块) 转成 str 避免 repr 爆炸.
+    """
+    type_name = type(msg).__name__
+    name = getattr(msg, "name", None)
+    name_part = f" ({name})" if name else ""
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        # tool_calls 之类 content 是 list of dict
+        content = str(content)
+    if not isinstance(content, str):
+        content = str(content)
+    preview = content[:50].replace("\n", " ") + ("..." if len(content) > 50 else "")
+    print(f"  {prefix}{type_name}{name_part}: {preview!r}")
+
+
+# ============================================================
 # 欢迎语 + 帮助
 # ============================================================
 WELCOME = """
@@ -170,13 +211,14 @@ WELCOME = """
 │  危险操作 (退款/写笔记/SQL) → 自动暂停审批  │
 │                                             │
 │  内置命令:                                  │
-│    /history   列出 checkpoints               │
-│    /rewind N  回到第 N 个 checkpoint         │
-│    /fork TXT  改历史后在新 thread 续走      │
-│    /memory    查看/编辑长期偏好              │
-│    /mysql     探测 MySQL 连接 + 列表         │
-│    /stats     Session 累计指标 (token/cost)  │
-│    /help      帮助                           │
+│    /history      列出 checkpoints            │
+│    /diff A B     比较两个 checkpoint 差异    │
+│    /rewind N     回到第 N 个 checkpoint      │
+│    /fork TXT     改历史后在新 thread 续走   │
+│    /memory       查看/编辑长期偏好           │
+│    /mysql        探测 MySQL 连接 + 列表      │
+│    /stats        Session 累计指标            │
+│    /help         帮助                        │
 │    /quit, /exit  退出                        │
 ╰─────────────────────────────────────────────╯
 """
@@ -185,6 +227,7 @@ WELCOME = """
 HELP_TEXT = """
 命令:
   /history           列出本 thread 所有 checkpoint (index 0=最新)
+  /diff <a> <b>      比较两个 checkpoint 差异 (message/tokens/latency)
   /rewind N          回到 history[N] 的状态 (N 是 history 列表索引, 0=最新)
   /fork <text>       在最新 checkpoint 上追加 <text>, 新 thread 续走
   /memory            查看偏好
@@ -204,6 +247,11 @@ HELP_TEXT = """
 
 每个 turn 完成后会自动打印一行指标:
   >>> 280ms · in 124 / out 86 · 1 tools · WeatherAgent · ~$0.0001
+
+/diff 用法:
+  /diff 1 3         列出 1→3 之间新增的 message + token delta + latency delta
+  /diff 3 1         反向 diff — 看 "回到 1" 会移除什么 (rewind 决策辅助)
+  只读, 不动 state / pending_checkpoint_id
 """
 
 
@@ -233,6 +281,9 @@ class CLI:
         # 后续 invoke 会从 history[n] 这个 checkpoint 开始 (走 time-travel replay)
         # ⚠️ 一次性: run_turn 完成后会清掉, 不然会一直卡在分支上
         self._rewind_ckpt: str | None = None
+        # ⭐ /diff 用: /history 跑完后填充, [{id, msgs, latency_ms, next}, ...]
+        # /diff 通过这里拿 checkpoint_id + latency 字段, 不用再 query history
+        self.history_checkpoints: list[dict] = []
         # ⭐ Observability: 默认 None 时创建新的 SessionMetrics, 传入则复用 (测试场景)
         self.metrics = session_metrics or SessionMetrics(model_name=model_name)
         # model_name 单独存一份, 用于新 turn 的 cost 计算
@@ -302,6 +353,10 @@ class CLI:
             self._cmd_history()
             return False
 
+        if cmd == "/diff":
+            self._cmd_diff(parts[1:])
+            return False
+
         if cmd == "/rewind":
             if len(parts) < 2:
                 print("用法: /rewind N  (N 是 history 列表索引, 0=最新)")
@@ -348,12 +403,31 @@ class CLI:
         # 带 checkpoint_id 时 get_state_history 只返回该 ckpt 及之后, 看不到前面.
         history_cfg = {"configurable": {"thread_id": self.active_thread_id}}
         history = list(self.graph.get_state_history(history_cfg))
+
+        # ⭐ 填充 self.history_checkpoints — /diff 命令用它取 checkpoint_id + latency
+        # latency_ms: 这个 checkpoint 距上一个的 wall-clock ms (首个 0)
+        # 用 created_at 算 — 比 TurnMetrics.latency_ms 更准 (后者是 streaming 时长,
+        # 不含 HITL 等待 / 中断暂停)
+        self.history_checkpoints = []
+        prev_ts_ms: int | None = None
+        for snap in history:
+            ts_ms = _parse_iso_ms(getattr(snap, "created_at", None))
+            latency_ms = (ts_ms - prev_ts_ms) if (prev_ts_ms is not None and ts_ms) else 0
+            prev_ts_ms = ts_ms if ts_ms else prev_ts_ms
+            self.history_checkpoints.append({
+                "id": snap.config["configurable"]["checkpoint_id"],
+                "msgs": len(snap.values.get("messages", [])),
+                "latency_ms": latency_ms,
+                "next": snap.next,
+            })
+
         print(f"\n>>> 共 {len(history)} 个 checkpoint (history[0]=最新):")
-        for i, snap in enumerate(history):
-            ckpt_short = snap.config["configurable"]["checkpoint_id"][:8]
-            n_msgs = len(snap.values.get("messages", []))
-            next_node = snap.next
-            print(f"  [{i:>3}] ckpt={ckpt_short}... | msgs={n_msgs} | next={next_node}")
+        for i, ckpt in enumerate(self.history_checkpoints):
+            ckpt_short = ckpt["id"][:8]
+            print(
+                f"  [{i:>3}] ckpt={ckpt_short}... | msgs={ckpt['msgs']} "
+                f"| latency={ckpt['latency_ms']}ms | next={ckpt['next']}"
+            )
 
     def _cmd_rewind(self, n: int) -> None:
         # 同样用干净 config 拿完整 history
@@ -393,6 +467,93 @@ class CLI:
         print(f">>> Fork 到新 thread: {new_thread}")
         print(f">>> 续走中...")
         await self._continue_turn(new_config)
+
+    def _cmd_diff(self, args: list[str]) -> None:
+        """比较两个 checkpoint 之间的差异 (message + tokens + latency).
+
+        用法: /diff <a> <b>  (a b 是 /history 里的 1-based 索引, 顺序无关)
+              /diff 1 3 → 列出 1→3 之间新增的 message + token delta + latency delta
+              /diff 3 1 → 反向: 列出"从 3 回到 1"会移除哪些 message (rewind 决策辅助)
+
+        ⚠️ 只读 — 不动 pending_checkpoint_id, 不调用 invoke / astream.
+        /rewind 仍按 history_checkpoints 当前索引走, /diff 纯分析不修改.
+        """
+        if len(args) != 2:
+            print("usage: /diff <a> <b> (checkpoint 索引, 1-based)")
+            return
+        if not self.history_checkpoints:
+            print(">>> 没有 history, 先跑 /history")
+            return
+        try:
+            a_idx = int(args[0]) - 1  # 1-based → 0-based
+            b_idx = int(args[1]) - 1
+        except ValueError:
+            print("usage: /diff <a> <b> (checkpoint 索引, 1-based)")
+            return
+        if not (0 <= a_idx < len(self.history_checkpoints)
+                and 0 <= b_idx < len(self.history_checkpoints)):
+            print(
+                f">>> checkpoint 索引越界, 跑 /history 看可用索引 "
+                f"(1-{len(self.history_checkpoints)})"
+            )
+            return
+        if a_idx == b_idx:
+            print(
+                f">>> Diff #{a_idx+1} → #{b_idx+1}: 同一 checkpoint, 无变化"
+            )
+            return
+
+        old_ckpt = self.history_checkpoints[a_idx]
+        new_ckpt = self.history_checkpoints[b_idx]
+
+        # ⚠️ 用 self.active_thread_id 而不是 thread_id — fork 后会切换
+        # 读的是当前 thread 的 checkpoint, 不是原 thread
+        old_state = self.graph.get_state({
+            "configurable": {
+                "thread_id": self.active_thread_id,
+                "checkpoint_id": old_ckpt["id"],
+            }
+        })
+        new_state = self.graph.get_state({
+            "configurable": {
+                "thread_id": self.active_thread_id,
+                "checkpoint_id": new_ckpt["id"],
+            }
+        })
+        old_msgs = old_state.values.get("messages", [])
+        new_msgs = new_state.values.get("messages", [])
+
+        # 用 message.id 去重 + 比较 (LangGraph 有时同一 message 多次出现)
+        # id() fallback: 跨 checkpoint 比较时, 没 id 的 message 仍能区分
+        old_ids = {(m.id or id(m)) for m in old_msgs}
+        new_ids = {(m.id or id(m)) for m in new_msgs}
+        added = [m for m in new_msgs if (m.id or id(m)) not in old_ids]
+        removed = [m for m in old_msgs if (m.id or id(m)) not in new_ids]
+
+        # ⭐ Token delta — 复用 metrics.extract_tokens (不去重重复实现)
+        old_in, old_out = extract_tokens(old_state.values)
+        new_in, new_out = extract_tokens(new_state.values)
+        delta_in = new_in - old_in
+        delta_out = new_out - old_out
+
+        # Latency delta — history_checkpoints 已有 latency_ms 字段
+        # (wall-clock ms from prev ckpt, /history 时填的)
+        delta_latency = new_ckpt.get("latency_ms", 0) - old_ckpt.get("latency_ms", 0)
+
+        direction = "old→new" if a_idx < b_idx else "new→old"
+        print(f">>> Diff #{a_idx+1} → #{b_idx+1} ({direction}):")
+        print(f"  + {len(added)} added, {len(removed)} removed")
+        print(f"  Δ tokens: {delta_in:+d} in / {delta_out:+d} out")
+        print(f"  Δ latency: {delta_latency:+d}ms")
+
+        if not added and not removed:
+            return  # 空 diff, 只 header 就够
+
+        print()
+        for msg in added:
+            _print_msg_line(msg, prefix="+ ")
+        for msg in removed:
+            _print_msg_line(msg, prefix="- ")
 
     async def _stream_and_print(self, input_data: dict, config: dict) -> None:
         """统一处理 astream + token 打印 + 错误捕获.
