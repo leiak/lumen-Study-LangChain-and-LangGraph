@@ -441,7 +441,7 @@ def execute_safe_select(
 
     for attempt in range(max_attempts):
         if attempt > 0:
-            # backoff: 1s, 2s, 4s — 仅第 2/3 次前 sleep
+            # backoff: 1s, 2s — 3 attempts = 2 inter-sleeps (attempt 2 前 sleep 1s, attempt 3 前 sleep 2s)
             time.sleep(2 ** (attempt - 1))
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
