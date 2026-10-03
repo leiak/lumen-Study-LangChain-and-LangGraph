@@ -1,6 +1,6 @@
 # 08-cli-assistant — 智能个人助手 CLI
 
-> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful)
+> ✅ Smoke-tested: import chain OK · 9 tools OK · memory prefs OK · async command routing OK · PII redaction OK (5 类: ID / 手机 / 银行卡 / 邮箱 / IPv4) · HITL preview OK (run_sql EXPLAIN / refund 余额 / write_note 内容) · AST parse 8/8 OK · MySQL audit OK (SELECT/INSERT/DROP/UNION/--/*/multi-stmt/LOAD_FILE) · SQL error enrich OK (1146/1054/1052) · transient retry OK (1205/1213/2003/2006/2013/1040) · Notes persistence OK (JSONL 加载/写入/损坏行 graceful)
 
 把项目里分散在各 demo 的**高级用法**串成一个真正能跑的端到端 CLI 工具:
 streaming token 打印 + HITL 审批 + supervisor 多 agent 路由 + PII middleware
@@ -142,6 +142,54 @@ UX 跟 `refund_order` / `write_note` 一致: `[a]pprove` / `[r]eject` (cli.py `_
 
 实测优势: LLM 拿到 "列 'usr_name' 不存在. 你是不是想用 (在表 users): name?" 后**自动改写** SQL
 成 `SELECT name FROM users WHERE ...`, 不用 user 介入。
+
+### 错误恢复 (transient retry)
+
+LLM 看到的 SQL 执行, 在 retry 层是不透明的 — 只有当 retry 全部失败时, LLM 才
+会收到 enriched 错误。瞬时网络抖动 / lock 等待 / deadlock 这些"下次大概率能
+成功"的错误, LLM 根本感知不到, 用户体验上是"无感恢复"。
+
+**核心机制** (`mysql_db.execute_safe_select`):
+
+| 配置 | 值 | 说明 |
+|---|---|---|
+| `max_attempts` | 3 | initial + 2 retries (默认参数 `_MAX_RETRY_ATTEMPTS`) |
+| Backoff | 1s, 2s | 第 2 次前 sleep 1s, 第 3 次前 sleep 2s (指数) |
+| 总等待上限 | 3s | 3rd attempt 无 preceding sleep |
+| Audit | 1 次 | retry loop 前跑一次, 不每次重 audit |
+| Markdown | loop 外 | 失败 → raise 给 `_enrich_error`; 成功 → loop 外格式化 |
+
+**识别的 transient errno** (`_TRANSIENT_MYSQL_CODES`, 6 个):
+
+| errno | 含义 | 何时会发生 |
+|---|---|---|
+| 1205 | ER_LOCK_WAIT_TIMEOUT | 其它事务持锁, 等一下能拿到 |
+| 1213 | ER_LOCK_DEADLOCK | MySQL 已自动回滚, 重试代价小 |
+| 2003 | CR_CONN_HOST_ERROR | 服务重启 / 网络瞬断 |
+| 2006 | CR_SERVER_GONE_ERROR | 长时间 idle 后 server 主动断开 (配合 `pool_pre_ping`) |
+| 2013 | CR_SERVER_LOST | 查询过程中连接被踢 (server timeout / 网络) |
+| 1040 | ER_CON_COUNT_ERROR | 连接池挤爆, 等别的连接释放 |
+
+**永久错 (不重试)**:
+
+| errno | 含义 | 为什么永久 |
+|---|---|---|
+| 1146 | Table doesn't exist | 表不存在, 重试也是同样的错 |
+| 1054 | Unknown column | 列不存在 |
+| 1052 | Ambiguous column | JOIN 时需限定 |
+| 1064 | Syntax error | SQL 语法错 |
+| 1364 | No default value | 缺字段 (但 read-only 不太会遇到) |
+| — | ValueError (audit 拒) | 写操作 / 黑名单子串 / 多语句 |
+| — | RuntimeError (env 缺) | MySQL 配置问题, 重试无效 |
+| — | TimeoutError | 查询本质慢, 重试大概率还超时 |
+
+**Effective UX**:
+- **LLM 看不到 transient 抖动** — 3 次内恢复的, LLM 跟没出错一样
+- **最终失败才 enriched** — 3 次都 transient 失败, raise 最后一次给 `_enrich_error`,
+  LLM 拿到 `[SQL 执行失败] (1213, "Deadlock found...")` (当前不 enrich 1213,
+  透传 raw — 后面批次可补)
+- **生产可调** — `execute_safe_select(engine, sql, max_attempts=5)` 可调更多
+  attempts; 当前 hardcode 3 次是 YAGNI
 
 ### 已知坑
 
@@ -414,6 +462,18 @@ HITL 只挂在有危险工具的 specialist 上 — 其它 specialist 挂 `hitl`
     带连字符的卡号 `6222-0212-3456-7890` 不被匹配 (这是有意的: 用户输入带
     格式的卡号时, 我们不脱敏 — 防 false positive; 生产可加 dedicated
     `[\d-]{16,23}` 模式匹配带格式的卡号)。
+16. **`time.sleep` 阻塞 thread (transient retry)** — `execute_safe_select` 当前是
+    sync, 阻塞 caller 最多 3s (1s + 2s backoff)。CLI 是 REPL 单线程, 阻塞期间
+    不会有其它 turn 并发, UX 实际可接受。生产 async 应改 `asyncio.sleep` +
+    async engine (`asyncmy` / `aiomysql`)。YAGNI — demo 阶段 sync 可用。
+17. **审计重试边界 (transient retry)** — audit 在 retry loop 前跑一次, 假设
+    "同一 SQL 多次尝试"。如果 LLM 在 retry 期间改 SQL (理论不会 — retry 是
+    内部 sync 循环, LLM 看不到中间状态), 改 SQL 后需重新 audit。当前实现
+    故意不支持"retry 期间动态改 SQL" — LLM 改 SQL 会重新进 `_enrich_error`
+    走第二次 `run_sql` invoke, audit 自动重跑。OK。
+18. **`_extract_errno` 5 层嵌套防爆 (transient retry)** — 实际 SQLAlchemy 异常链
+    通常 1-2 层 (`.orig.args[0]`), 5 层足够防 `.orig.orig.orig.orig.orig` 极端
+    情况。某些 library 包装可能更深的链, 但概率极低 — 5 层守底安全。
 
 ## 复用项目内 demo
 

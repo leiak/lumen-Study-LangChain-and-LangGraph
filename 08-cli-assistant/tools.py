@@ -309,6 +309,17 @@ def run_sql(query: str) -> str:
       - 自动 LIMIT 1000 (防 OOM)
       - 10s 查询超时 (ThreadPoolExecutor client-side kill)
 
+    Transient retry (mysql_db._TRANSIENT_MYSQL_CODES):
+      - 自动重试 3 次 (initial + 2 retries), backoff 1s/2s (max 3s 等待)
+      - 仅对 lock / 连接类 errno 重试:
+        1205 Lock wait timeout · 1213 Deadlock ·
+        2003 Can't connect host · 2006 Server gone away · 2013 Lost connection ·
+        1040 Too many connections
+      - 永久 SQL 错 (1146/1054/1052/1064/1364) 不重试 — 失败是确定的
+      - audit 拒绝 (ValueError) 不重试 — 永久
+      - 查询超时 (ThreadPoolExecutor TimeoutError) 不重试 — 下次大概率还慢
+      - 3 次仍失败: raise 给 _enrich_error 兜底 (LLM 拿到 enriched 错误)
+
     错误处理:
       - MySQL 未配置: 友好提示 (RuntimeError)
       - audit 拒绝: 转 [安全审计拒绝] 给 LLM (ValueError)
