@@ -16,6 +16,7 @@
 | 04 | `04_review_loop.py` | `subprocess` + `fix_code` | 跑 pytest → 失败 LLM 修 → 重跑直到 pass (max_retries=3) |
 | 05 | `05_multi_agent_coder.py` | `StateGraph` + `create_agent` + `@tool` | 3 specialist (Planner / Coder / Reviewer) + supervisor 状态机 |
 | 06 | `06_human_review.py` | `HumanInTheLoopMiddleware` + 3 HITL gates | 关键决策点 (plan / 每个文件 / fix) 加人工审批 |
+| 07 | `07_incremental_diff.py` | SEARCH/REPLACE 块 + `difflib.SequenceMatcher` 模糊匹配 | review loop 改用增量 diff (省 50%+ token, Cursor/Copilot pattern) |
 
 ## 推荐阅读顺序
 
@@ -37,6 +38,8 @@ codegen_pipeline.py ← 再懂"从 plan 到 code 到 test 的 pipeline"
 05_multi_agent_coder.py     ← supervisor 编排 3 specialist 跑完整 pipeline
    ↓
 06_human_review.py          ← 3 HITL gates (plan / 每个文件 / fix) 加人工审批
+   ↓
+07_incremental_diff.py      ← review loop 改用增量 diff (省 50%+ token)
 ```
 
 ## 跑起来
@@ -52,6 +55,7 @@ python 09-codegen-agent/03_test_generation.py
 python 09-codegen-agent/04_review_loop.py
 python 09-codegen-agent/05_multi_agent_coder.py
 python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
+python 09-codegen-agent/07_incremental_diff.py
 ```
 
 每个 demo 都独立运行,运行时把生成的代码写到 `09-codegen-agent/output/` (gitignored)。
@@ -75,6 +79,7 @@ python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
 12. 为什么 HITL middleware 要写工厂函数 (`_hitl()`) 而不是模块级单例? (state_schema 冲突)
 13. 怎么从 `state.tasks[0].interrupts` 抽 tool_call 的 name + args? (LangChain 1.x `action_requests[0]` 格式)
 14. codegen pipeline 哪几个动作适合加 HITL gate? (plan / 每个文件 / fix — 3 个 trade-off: 安全 vs UX 累)
+15. 增量 diff (`SEARCH/REPLACE` 块 + `difflib`) 比全文件 regen 省多少 token? 什么场景应该用哪种?
 
 ## 复用 L1 的方式 (DRY)
 
@@ -120,6 +125,45 @@ Demo 6 把 HumanInTheLoopMiddleware (LangChain 1.x native, 跟 L1 demo 5 一致)
 - **异步 stdin** — `await asyncio.to_thread(input)` 不阻塞事件循环
 - **Command(resume=...)** 走同一 thread_id 恢复 graph
 
+## Incremental diff (Demo 7)
+
+Demo 7 把 Demo 4 "全文件 regen" 改成 "只输出 SEARCH/REPLACE 块", 走 Cursor/Copilot/Aider
+风格的 diff-based prompting。 1000 行文件 1-line bug, full regen ~1500 字符, incremental ~200 字符,
+**约 7.5x token 节省**。
+
+核心组件 (在 `codegen_pipeline.py`):
+- **`fix_code_incremental(llm, code, error)`** — 调 LLM, 拿 SEARCH/REPLACE 响应, apply 到原 code
+- **`extract_search_replace_blocks(text)`** — regex 抓 `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` 块
+- **`apply_search_replace(code, search, replace)`** — 优先 exact match, fallback `difflib.SequenceMatcher`
+
+SEARCH/REPLACE 块格式 (Aider 风格):
+```
+<<<<<<< SEARCH
+def foo(x):
+    return x + 1
+=======
+def foo(x):
+    return x + 2
+>>>>>>> REPLACE
+```
+
+设计要点:
+- **SEARCH 块 2-5 行 + 上下文** — 太短可能歧义匹配 (code 里出现多次), 太长 LLM 容易吐不一致的空白
+- **difflib fallback threshold 0.6** — exact match 失败时, 模糊匹配最相似的连续 N 行 (ratio > 0.6 才替换)
+- **解析失败 → 保留原 code** (defensive) — LLM 偶尔吐 markdown 解释或省略 SEARCH 标记, 不破坏原 code
+- **response size 是 token proxy** — `len(llm_response)` 跟真实 token 数高度相关, 不需要 tokenizer
+
+跟 Demo 4 的关键区别:
+
+| 维度 | Demo 4 (full regen) | Demo 7 (incremental) |
+|------|--------------------|--------------------|
+| LLM 输出大小 | 跟原 code 长度正比 | 跟改动大小正比 (大文件小 bug 也省) |
+| 风险 | LLM 可能"顺手优化"无关代码 | 只动指定区域, 副作用小 |
+| 适用 | 小文件, 大改, 第一次生成 | 大文件, 小 bug, retry loop |
+| 生产参考 | 老式 code completion | Cursor / Copilot / Aider / Continue |
+
+生产建议: full regen 用于 first-pass (没历史上下文), incremental 用于 retry (改 1-3 行)。
+
 ## 已知坑
 
 1. **MiniMax M3 CoT 干扰**: `with_structured_output` 主路失败时, 切备路 `_strip_think` + `PydanticOutputParser`。
@@ -135,6 +179,9 @@ Demo 6 把 HumanInTheLoopMiddleware (LangChain 1.x native, 跟 L1 demo 5 一致)
 9. **Demo 6 HITL interrupt API 跨 LangGraph 版本可能变**: 我们读 `state.tasks[0].interrupts[0].value.action_requests[0]`, 这是 LangChain 1.x middleware 格式。 升级到 1.x 更高版本时如果 action_requests 字段名变, 改 `_extract_tool_info_from_interrupt` 即可 (有 4 种格式 fallback, 见 08-cli-assistant/cli.py 同名函数)。
 10. **Demo 6 3 gate 全开 UX 累**: 每个文件都触发 gate 2, 5 文件 spec → 7+ 次中断。 真实生产建议只开 gate 1 (plan) + gate 3 (fix), gate 2 (每文件) 太繁琐 — 信任 LLM 写到 output/, 出错用户最后看 diff 就行。
 11. **Demo 6 edit 模式简化 UX**: 改 args 走 `key=value` 简单拆分 (shlex), 不支持嵌套 JSON 编辑。 plan_json 这种大字段只展示截断, 编辑会被跳过。 实战更友好是 pop-up 编辑器 / diff 视图。
+12. **Demo 7 SEARCH/REPLACE 块分隔符严格匹配**: regex 是 `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` (7 个 `<`, 7 个 `>`)。 LLM 偶尔吐变体 (e.g. `<<<< SEARCH`, `===`, `>>>>`), 解析失败 → 返回原 code (defensive)。 生产可考虑加常见变体 fallback 或要求 LLM "严格按格式"。
+13. **Demo 7 difflib threshold 0.6 太低可能误替换**: demo 用 0.6 接受更多匹配, 但 production 应该 0.8+ (e.g. Aider 默认 0.75)。 threshold 越低, 模糊匹配越多, 误替换概率越大。 防御: 同时要求 `n` 至少 2 行 (避免单行歧义)。
+14. **Demo 7 解析失败 defensive 不抛错**: LLM 没出 SEARCH/REPLACE 块时, `fix_code_incremental` 返回原 code 而不是 raise。 这避免了"上游 prompt 误导 → 下游 pipeline 全炸", 但也意味着 silent failure — 调用方应该 log + 检查返回值是否真被改了 (e.g. compare len before/after 或 hash)。
 
 ## 跟其它模块的关系
 
