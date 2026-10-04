@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Callable
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -437,9 +438,9 @@ def plan_to_code_with_deps(
 async def plan_to_code_streaming(
     llm,
     plan: Plan,
-    output_dir=None,
-    on_token=None,
-):
+    output_dir: Path | None = None,
+    on_token: Callable[[str], None] | None = None,
+) -> tuple[list[Path], list[StreamResult]]:
     """Streaming 写盘: 每文件 astream 累积 → safety scan → 写盘.
 
     跟 `safe_plan_to_code` 的区别:

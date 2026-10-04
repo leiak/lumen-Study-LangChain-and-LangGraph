@@ -181,9 +181,12 @@ async def iter_llm_tokens(
         token = chunk.content if hasattr(chunk, "content") else str(chunk)
         if not token:
             continue
+        # Track per-token elapsed from the FIRST token onward
         if first_token_time is None:
             first_token_time = time.perf_counter()
-        elapsed = (first_token_time - start) if first_token_time is not None else 0.0
+            elapsed = 0.0  # first token: 0
+        else:
+            elapsed = time.perf_counter() - first_token_time  # subsequent: time since first
         yield token, elapsed
 
 
