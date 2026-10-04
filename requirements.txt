@@ -27,6 +27,10 @@ langsmith>=0.4
 faiss-cpu>=1.8                   # 内存向量库
 # chromadb>=0.5                 # 可选,持久化向量库
 
+# RAG 进阶 (10-rag-deep-dive)
+rank-bm25>=0.2.2                 # BM25 keyword retrieval (10-rag-deep-dive 用)
+langchain-experimental>=0.4      # SemanticChunker (10-rag-deep-dive/04 用, 已 sunset 但仍是唯一 stable 来源)
+
 # Deep Agents (L5)
 deepagents>=0.1
 
