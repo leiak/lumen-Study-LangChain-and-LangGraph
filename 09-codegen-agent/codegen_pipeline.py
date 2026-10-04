@@ -19,6 +19,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from _common import extract_python_blocks, step, write_code_file
 from _common import output_dir as default_output_dir
 from plan_schema import FileSpec, FunctionSpec, Plan
+from dep_graph import (
+    CycleError,
+    build_dep_graph,
+    topological_sort,
+)
 from safety import Severity, format_findings, has_block_findings, scan_code
 
 
@@ -310,9 +315,126 @@ def safe_plan_to_code(llm, plan: Plan, output_dir: Path | None = None) -> list[P
     return written
 
 
+def plan_to_code_with_deps(
+    llm,
+    plan: Plan,
+    output_dir: Path | None = None,
+) -> list[Path]:
+    """Dep-aware 写盘: 先 build graph, topo sort, 然后按依赖顺序生成.
+
+    区别于 `plan_to_code` (按 plan 列表顺序) —
+    这里用 topological sort 保证:
+        - utils.py 在 main.py 之前生成
+        - 不会出现"先有 consumer, 后 provider"的死锁
+
+    集成 safety gate (跟 safe_plan_to_code 一致):
+        - 每个文件生成后跑 scan_code
+        - BLOCK finding → 跳过该文件 (不写盘)
+        - WARN finding → 写但打印警告
+
+    ⚠️ 设计决策: graph 何时构建?
+      - 方案 A: 用 LLM 之前 plan 里的 files (无 content), graph 全空
+      - 方案 B: 生成 content 后构建 graph, 但生成顺序不确定 → chicken-egg
+      - 我们采用方案 C: 按 plan.files 顺序生成 code, **同时**构建 graph;
+        topo sort 用于 "写盘" 顺序, 而不是 LLM 调用顺序.
+        这样:
+          - LLM 调用按 plan 顺序 (确定性, 易调试)
+          - 写盘按 dep 顺序 (utils 一定在 main 前)
+          - graph 反映真实 content (非空时)
+
+    Args:
+        llm: LLM 实例
+        plan: Plan Pydantic 对象
+        output_dir: 输出目录 (默认 = `output_dir()` 当前模块默认目录)
+
+    Returns:
+        成功写入的文件路径列表 (按 topo sort 顺序).
+
+    Raises:
+        CycleError: 依赖图含循环依赖 (不沉默, 跟 spec validation 风格一致).
+                    调用方可以:
+                    - 直接让 caller 看到错误 (fail fast)
+                    - 走 add_forward_decls 重试 (LLM 加 TYPE_CHECKING)
+    """
+    if output_dir is None:
+        output_dir = default_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 先生成所有 file content (按 plan 顺序, 确定性, 易调试)
+    #    然后用真实 content 构建 graph
+    print("\n  [phase 1] 生成所有 file content (按 plan 顺序)...")
+    file_codes: dict[str, str] = {}
+    for i, file_spec in enumerate(plan.files, 1):
+        step(i, f"生成 {file_spec.path}")
+        code = file_to_code(llm, file_spec)
+        file_codes[file_spec.path] = code
+        print(f"  ({len(code)} 字符)")
+
+    # 2. 构建 dep graph (用真实 content) + topo sort
+    print("\n  [phase 2] 构建 dep graph + 拓扑排序...")
+    enriched_files = [
+        FileSpec(path=f.path, purpose=f.purpose, functions=f.functions, content=code)
+        for f, code in zip(plan.files, [file_codes[fs.path] for fs in plan.files])
+    ]
+    graph = build_dep_graph(enriched_files)
+    print(f"  graph ({len(graph)} nodes):")
+    for k, v in graph.items():
+        deps = ", ".join(Path(d).name for d in v) or "(无)"
+        print(f"    {Path(k).name:20} → {deps}")
+
+    try:
+        order = topological_sort(graph)
+    except CycleError as e:
+        print(f"\n  ⛔ 检测到 {len(e.cycles)} 个循环依赖:")
+        for cycle in e.cycles:
+            print(f"     {' → '.join(Path(p).name for p in cycle)}")
+        print(f"  💡 解决: 加 TYPE_CHECKING forward decl 或重构依赖方向")
+        raise
+
+    names = " → ".join(Path(p).name for p in order)
+    print(f"  ✓ 拓扑顺序: {names}")
+
+    # 3. 按 topo 顺序写盘 + safety scan
+    print("\n  [phase 3] 按 dep 顺序写盘 (with safety gate)...")
+    written = []
+    blocked_count = 0
+    warn_count = 0
+    for path_str in order:
+        file_spec = next(f for f in plan.files if f.path == path_str)
+        code = file_codes[path_str]
+        print(f"\n  --- {file_spec.path} ---")
+
+        findings = scan_code(code, file_spec.path)
+        if has_block_findings(findings):
+            blocked_count += 1
+            print(f"  ⛔ BLOCKED by safety scan")
+            print(format_findings(findings))
+            continue
+
+        warns = [f for f in findings if f.severity == Severity.WARN]
+        if warns:
+            warn_count += 1
+            print(f"  ⚠️  {len(warns)} warnings (writing anyway):")
+            for f in warns:
+                loc = f"line {f.line_no}" if f.line_no else "全文"
+                print(f"    - {f.pattern} @ {loc}: {f.snippet!r}")
+
+        path = output_dir / file_spec.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code, encoding="utf-8")
+        print(f"  ✓ 写入 {path} ({len(code)} 字符)")
+        written.append(path)
+
+    # 4. 总结
+    total = len(plan.files)
+    print(f"\n  plan_to_code_with_deps 总结: 写入 {len(written)}/{total} (BLOCK {blocked_count}, WARN {warn_count})")
+    return written
+
+
 __all__ = [
     "plan_to_code",
     "safe_plan_to_code",
+    "plan_to_code_with_deps",
     "file_to_code",
     "code_to_test",
     "fix_code",

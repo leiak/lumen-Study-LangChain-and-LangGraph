@@ -14,7 +14,7 @@ import re
 from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ============================================================
@@ -30,7 +30,16 @@ class FunctionSpec(BaseModel):
 
 
 class FileSpec(BaseModel):
-    """单个文件的规格."""
+    """单个文件的规格.
+
+    💡 model_config extra='allow':
+      LLM 不会吐 content (content 是 file_to_code 之后产物).
+      但 dep_graph.py 需要 `f.content` 来分析 import 关系,
+      通过 `getattr(f, "content", "")` 兜底, 没 content 时视为空.
+      允许 extras 让 demo 9 可以 `FileSpec(..., content='...')` 注入生成代码.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     path: str = Field(description="相对路径, e.g. 'fizzbuzz.py'")
     purpose: str = Field(description="文件用途, 一句话")
