@@ -254,6 +254,7 @@ written = safe_plan_to_code(llm, plan)
     生产推荐接 `detect-secrets` (基于 entropy + 上下文) 而非自造 regex。
 17. **Demo 8 `subprocess shell=True` regex 太宽**: 当前 regex `shell\s*=\s*True` 不区分 `shell=False` 注释 / 文档字符串。 实测中 docstring 写 "shell=False is safer" 会触发 BLOCK。 AST layer 应该 parse kwarg 验证, 未来可以增强为: `Call(func=subprocess...) and any(kw.arg=='shell' and kw.value.value is True)` 才 BLOCK。
 18. **Demo 8 scanner 自扫会 meta-level 命中**: `safety.py` 自身包含 `re.compile(r"\beval\s*\(")` 等字面量, scanner 扫自己 → 命中 19 BLOCK findings。 这是预期 (meta-level), scanner "诚实" 报告自身代码里的危险 pattern。 部署时: 配置 scanner 跳过自身 source path, 或把规则定义放到独立 JSON / YAML 文件, 让 scanner 代码不含字面量 pattern。 Demo 8 step 7 演示这点。
+19. **Demo 8 multiline `open().write()` 漏报已修复 (R13 fix)**: 之前 regex `open\s*\(\s*[^)]*\)\s*\.write\s*\(` 的 `[^)]*` 不跨行, 只能抓单行 `open("x").write(...)`; 多行 `f = open("x.txt")\nf.write("hello")` 漏报。 R13 修复: AST layer 加 open_vars 跟踪, `f = open(...)` 把 `f` 加进集合, 后续 `f.write(...)` 触发 `open_write` WARN。 新增 unit test case #7 验证多行 pattern 被捕获。 局限: open_vars 不区分函数作用域, 跨 scope 复用变量名会有少量 false positive (acceptable trade-off)。
 
 ## 跟其它模块的关系
 
