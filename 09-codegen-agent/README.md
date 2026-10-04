@@ -15,6 +15,7 @@
 | 03 | `03_test_generation.py` | `code_to_test` | code → pytest tests → `output/test_<filename>.py` |
 | 04 | `04_review_loop.py` | `subprocess` + `fix_code` | 跑 pytest → 失败 LLM 修 → 重跑直到 pass (max_retries=3) |
 | 05 | `05_multi_agent_coder.py` | `StateGraph` + `create_agent` + `@tool` | 3 specialist (Planner / Coder / Reviewer) + supervisor 状态机 |
+| 06 | `06_human_review.py` | `HumanInTheLoopMiddleware` + 3 HITL gates | 关键决策点 (plan / 每个文件 / fix) 加人工审批 |
 
 ## 推荐阅读顺序
 
@@ -34,6 +35,8 @@ codegen_pipeline.py ← 再懂"从 plan 到 code 到 test 的 pipeline"
 04_review_loop.py           ← test 失败 → LLM 修 → 重跑
    ↓
 05_multi_agent_coder.py     ← supervisor 编排 3 specialist 跑完整 pipeline
+   ↓
+06_human_review.py          ← 3 HITL gates (plan / 每个文件 / fix) 加人工审批
 ```
 
 ## 跑起来
@@ -48,6 +51,7 @@ python 09-codegen-agent/02_plan_to_code.py
 python 09-codegen-agent/03_test_generation.py
 python 09-codegen-agent/04_review_loop.py
 python 09-codegen-agent/05_multi_agent_coder.py
+python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
 ```
 
 每个 demo 都独立运行,运行时把生成的代码写到 `09-codegen-agent/output/` (gitignored)。
@@ -67,6 +71,10 @@ python 09-codegen-agent/05_multi_agent_coder.py
 8.  用 `@tool` 装饰器把 Python 函数暴露给 specialist agent
 9.  设计 supervisor 路由函数: 根据 state.phase 决定下一个 node
 10. 复用一个 L1 `_common.py` 到别的模块: `importlib.util.spec_from_file_location` 模式
+11. 用 `HumanInTheLoopMiddleware` 给危险工具加审批: 3 种决策 (approve/edit/reject) 怎么走 `Command(resume=...)` 恢复 graph?
+12. 为什么 HITL middleware 要写工厂函数 (`_hitl()`) 而不是模块级单例? (state_schema 冲突)
+13. 怎么从 `state.tasks[0].interrupts` 抽 tool_call 的 name + args? (LangChain 1.x `action_requests[0]` 格式)
+14. codegen pipeline 哪几个动作适合加 HITL gate? (plan / 每个文件 / fix — 3 个 trade-off: 安全 vs UX 累)
 
 ## 复用 L1 的方式 (DRY)
 
@@ -94,6 +102,24 @@ get_llm = _l1_common.get_llm
 `importlib.util` 用独立 module name `_l1_common` 隔离, 避免循环引用。
 同款 pattern 见 `08-cli-assistant/_common.py`。
 
+## HITL gates (Demo 6)
+
+Demo 6 把 HumanInTheLoopMiddleware (LangChain 1.x native, 跟 L1 demo 5 一致) 挂到 codegen agent 上,
+在 3 个"写盘动作"前暂停等人批:
+
+| Gate | 触发工具 | 审批时看到什么 | 决策选项 |
+|------|---------|---------------|---------|
+| 1 | `tool_write_plan` | spec 预览 + LLM 生成的 plan 摘要 | `[a]pprove` / `[e]dit` (改 spec) / `[r]eject` |
+| 2 | `tool_write_code_file` (每个文件) | file_index + purpose + code 预览 | `[a]pprove` / `[e]dit` (跳到其它 idx) / `[r]eject` |
+| 3 | `tool_apply_fix` | code_filename + pytest error 摘要 + LLM 修正 | `[a]pprove` / `[e]dit` / `[r]eject` |
+
+设计要点 (跟 08-cli-assistant 一致):
+- **`_hitl()` 工厂函数** — HumanInTheLoopMiddleware 注入额外 state keys, 多个 agent 共享同一实例会冲突
+- **`[a]/[e]/[r]` CLI UX** — `e` 走 key=value 交互式编辑 args, EOF/Ctrl-C fallback reject
+- **`state.tasks[0].interrupts`** 读 interrupt — 比 `result["__interrupt__"]` 可靠, 跨 LangGraph 版本稳
+- **异步 stdin** — `await asyncio.to_thread(input)` 不阻塞事件循环
+- **Command(resume=...)** 走同一 thread_id 恢复 graph
+
 ## 已知坑
 
 1. **MiniMax M3 CoT 干扰**: `with_structured_output` 主路失败时, 切备路 `_strip_think` + `PydanticOutputParser`。
@@ -106,10 +132,15 @@ get_llm = _l1_common.get_llm
 6. **生成代码不要 commit**: `output/` 已加 `.gitignore`, 跑 demo 产物不入库。
 7. **5 demo 默认用 FizzBuzz spec**: 想测别的 spec, `load_spec("path/to/spec.md")` 或直接传字符串。
 8. **Demo 5 supervisor 简化**: coding_node 直接调 `plan_to_code`, 没让 Coder agent 自己决策。 真实项目可以让 agent 决定写几个文件 / 怎么拆。
+9. **Demo 6 HITL interrupt API 跨 LangGraph 版本可能变**: 我们读 `state.tasks[0].interrupts[0].value.action_requests[0]`, 这是 LangChain 1.x middleware 格式。 升级到 1.x 更高版本时如果 action_requests 字段名变, 改 `_extract_tool_info_from_interrupt` 即可 (有 4 种格式 fallback, 见 08-cli-assistant/cli.py 同名函数)。
+10. **Demo 6 3 gate 全开 UX 累**: 每个文件都触发 gate 2, 5 文件 spec → 7+ 次中断。 真实生产建议只开 gate 1 (plan) + gate 3 (fix), gate 2 (每文件) 太繁琐 — 信任 LLM 写到 output/, 出错用户最后看 diff 就行。
+11. **Demo 6 edit 模式简化 UX**: 改 args 走 `key=value` 简单拆分 (shlex), 不支持嵌套 JSON 编辑。 plan_json 这种大字段只展示截断, 编辑会被跳过。 实战更友好是 pop-up 编辑器 / diff 视图。
 
 ## 跟其它模块的关系
 
-- **L1 Models / Tools / Agents**: 复用 `get_llm` + `@tool` + `create_agent` (Demo 5)
-- **L2 LangGraph**: 复用 `StateGraph` / `TypedDict` / `add_conditional_edges` (Demo 5)
+- **L1 Models / Tools / Agents**: 复用 `get_llm` + `@tool` + `create_agent` (Demo 5/6)
+- **L1 Middleware**: 复用 `HumanInTheLoopMiddleware` (Demo 6, 见 04_middleware.py demo 5)
+- **L2 LangGraph**: 复用 `StateGraph` / `TypedDict` / `add_conditional_edges` (Demo 5), `InMemorySaver` / `Command` (Demo 6)
 - **L4 Multi-Agent**: supervisor + specialist 模式 (Demo 5)
+- **08-cli-assistant**: 复用 HITL `_hitl()` 工厂 + `[a]/[e]/[r]` CLI UX + `state.tasks[0].interrupts` interrupt 读取
 - **L6 OPC Product**: 同款"双轨 structured output + fallback"模式
