@@ -11,8 +11,6 @@
   - 工具 return 是 dict (结构化) 或 string (简单)
   - calculator 用 AST 而非 eval (避免代码注入)
 """
-from __future__ import annotations
-
 import ast
 import operator
 
