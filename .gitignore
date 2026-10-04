@@ -27,6 +27,9 @@ htmlcov/
 # Runtime data (CLI assistant persistence)
 08-cli-assistant/data/
 
+# Code generation output (generated code + tests)
+09-codegen-agent/output/
+
 # IDE
 .idea/
 .vscode/
