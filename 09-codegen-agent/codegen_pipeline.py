@@ -434,10 +434,95 @@ def plan_to_code_with_deps(
     return written
 
 
+async def plan_to_code_streaming(
+    llm,
+    plan: Plan,
+    output_dir=None,
+    on_token=None,
+):
+    """Streaming 写盘: 每文件 astream 累积 → safety scan → 写盘.
+
+    跟 `safe_plan_to_code` 的区别:
+      - safe_plan_to_code 走 `llm.invoke` (一次性, 慢)
+      - plan_to_code_streaming 走 `llm.astream` (边收边累积, TTFT <1s)
+
+    Args:
+        llm: LangChain ChatModel
+        plan: Plan Pydantic 对象
+        output_dir: 输出目录 (默认 = `output_dir()` 当前模块默认目录)
+        on_token: optional callback `on_token(token_str)` 给 UI hookup
+                  (传 None → 静默累积, 不回调)
+
+    Returns:
+        (written_paths, stream_results) tuple:
+          - written_paths: list[Path] — 成功写入的文件 (BLOCK 文件被剔除)
+          - stream_results: list[StreamResult] — 每个写盘文件的 timing 数据
+
+    ⚠️ 设计要点:
+      - 顺序生成 (按 plan.files 顺序), 不走 dep graph
+        (streaming UX 跟 demo 9 的 dep-aware 是 trade-off, 教学 demo 不混)
+      - safety scan 在累积完成时 (避免半截 code 误判)
+      - on_token 静默吞异常 (UI 渲染错不能打断 LLM 流)
+    """
+    # output_dir 在函数入口解析一次 (跟 safe_plan_to_code 一致)
+    if output_dir is None:
+        output_dir = default_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Lazy import — 避免 streaming.py 跟 codegen_pipeline 启动顺序耦合
+    from streaming import stream_file_code
+
+    def _safe_on_token(token: str) -> None:
+        """callback wrapper: 静默吞 on_token 异常, 不打断 LLM 流."""
+        if on_token is None:
+            return
+        try:
+            on_token(token)
+        except Exception:
+            # UI 渲染错不影响 codegen 流程
+            pass
+
+    written: list[Path] = []
+    results = []
+    blocked_count = 0
+
+    for i, file_spec in enumerate(plan.files, 1):
+        step(i, f"streaming 生成 {file_spec.path}")
+        result = await stream_file_code(llm, file_spec, on_token=_safe_on_token)
+
+        # === Safety scan ===
+        findings = scan_code(result.content, file_spec.path)
+        if has_block_findings(findings):
+            blocked_count += 1
+            print(f"  ⛔ BLOCKED by safety scan:")
+            print(format_findings(findings))
+            continue
+
+        # 写盘
+        path = output_dir / file_spec.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(result.content, encoding="utf-8")
+        print(
+            f"  ✓ 写入 {path} ({len(result.content)} 字符, "
+            f"TTFT {result.ttft_seconds:.2f}s, total {result.total_seconds:.2f}s, "
+            f"~{result.token_count} chunks)"
+        )
+        written.append(path)
+        results.append(result)
+
+    total = len(plan.files)
+    print(
+        f"\n  plan_to_code_streaming 总结: 写入 {len(written)}/{total} "
+        f"(BLOCK 跳过 {blocked_count})"
+    )
+    return written, results
+
+
 __all__ = [
     "plan_to_code",
     "safe_plan_to_code",
     "plan_to_code_with_deps",
+    "plan_to_code_streaming",
     "file_to_code",
     "code_to_test",
     "fix_code",
