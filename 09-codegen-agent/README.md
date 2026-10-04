@@ -19,6 +19,8 @@
 | 07 | `07_incremental_diff.py` | SEARCH/REPLACE 块 + `difflib.SequenceMatcher` 模糊匹配 | review loop 改用增量 diff (省 50%+ token, Cursor/Copilot pattern) |
 | 共享 | `safety.py` | regex + `ast` 两层扫描 | 静态安全扫描: BLOCK/WARN/INFO 三档, 默认规则覆盖 eval/exec/shell/pickle/dynamic-import |
 | 08 | `08_spec_validation.py` | `safe_plan_to_code` + 故意危险 spec | LLM 生成代码写盘前拦截危险模式 (eval/exec/secret), 演示 3 类 spec |
+| 共享 | `dep_graph.py` | `extract_imports` (regex) + `topological_sort` (Kahn's) + `detect_cycles` (DFS) | 跨文件依赖图工具: import 提取 + 拓扑排序 + 循环检测 + forward decl |
+| 09 | `09_cross_file_deps.py` | `build_dep_graph` + `topological_sort` + `plan_to_code_with_deps` | 多文件 codegen 按依赖顺序生成, 循环依赖 raise 不 silent, 演示 6 个步骤 (3 算法 + 3 LLM 集成) |
 
 ## 推荐阅读顺序
 
@@ -44,6 +46,8 @@ codegen_pipeline.py ← 再懂"从 plan 到 code 到 test 的 pipeline"
 07_incremental_diff.py      ← review loop 改用增量 diff (省 50%+ token)
    ↓
 safety.py + 08_spec_validation.py  ← safety gate 拦截危险代码 (eval/exec/secret)
+   ↓
+dep_graph.py + 09_cross_file_deps.py  ← 多文件 dep graph + 拓扑排序 + cycle detection
 ```
 
 ## 跑起来
@@ -61,6 +65,7 @@ python 09-codegen-agent/05_multi_agent_coder.py
 python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
 python 09-codegen-agent/07_incremental_diff.py
 python 09-codegen-agent/08_spec_validation.py
+python 09-codegen-agent/09_cross_file_deps.py
 ```
 
 每个 demo 都独立运行,运行时把生成的代码写到 `09-codegen-agent/output/` (gitignored)。
@@ -228,6 +233,61 @@ written = safe_plan_to_code(llm, plan)
 
 生产推荐: 静态扫描 + bandit + detect-secrets + RestrictedPython 组合, 不要单押一种。
 
+## Cross-file deps (Demo 9)
+
+Demo 9 解决多文件 codegen 的 import 顺序问题:
+LLM 生成 `app.py` 时如果 `from utils import helper`, 但 `utils.py` 还没生成
+(或后生成), Python 解释器报 `ModuleNotFoundError`。 Demo 9 用 dep graph +
+topo sort 保证依赖先生成, 同时检测循环依赖 (raise 不 silent)。
+
+**核心工具** (在 `dep_graph.py`):
+
+| 函数 | 算法 | 教学目的 |
+|------|------|---------|
+| `extract_imports(code)` | regex | 从 source 抓 `from X import Y` / `import X` 的 root module |
+| `build_dep_graph(files)` | 启发式 path→module | 构建 file_path → set of deps 的有向图, 忽略 stdlib |
+| `topological_sort(graph)` | Kahn's (BFS) | in-degree=0 优先处理, 同 in-degree 按名字排 (deterministic) |
+| `detect_cycles(graph)` | Tarjan-like DFS | 返回所有环, normalized dedup |
+| `add_forward_decls(content, mod, symbols)` | string prepend | `TYPE_CHECKING` forward declaration |
+| `CycleError(cycles)` | exception | raise 不 silent (跟 spec validation 风格一致) |
+
+**集成方式** (在 `codegen_pipeline.py`):
+```python
+from codegen_pipeline import plan_to_code_with_deps
+
+# 替换 plan_to_code / safe_plan_to_code: 自动按 dep 顺序写盘
+written = plan_to_code_with_deps(llm, plan, output_dir=out)
+# BLOCK finding → skip 写盘
+# 循环依赖 → raise CycleError (caller 处理, 可选 forward decl 重试)
+```
+
+**3 阶段设计**:
+1. **Phase 1**: 按 plan 顺序生成所有 file content (LLM 调用确定性)
+2. **Phase 2**: 用真实 content 构建 graph → topo sort
+3. **Phase 3**: 按 dep 顺序写盘 + safety scan
+
+为什么不一步到位? Phase 1 必须按 plan 顺序生成 (LLM 调用顺序不好改);
+topo sort 用于"写盘顺序"而非"生成顺序", 这样 graph 反映真实 content。
+
+**Demo 9 流程** (6 steps):
+1. **算法演示** (no LLM): linear chain → topo order 验证
+2. **算法演示**: a ↔ b cycle → `CycleError` 抛出
+3. **算法演示**: DFS `detect_cycles` 返回所有环
+4. **LLM 集成**: 3-file spec (User / Repository / app) → 生成 + graph 构建
+5. **LLM 集成**: cyclic spec → cycle 检测 + `add_forward_decls` 演示
+6. **端到端**: `plan_to_code_with_deps` on linear spec + import 验证
+
+跟其它扫描工具对比:
+
+| 工具 | 类型 | 适用 |
+|------|------|-----|
+| `dep_graph.py` (本 demo) | regex import + topo sort | 多文件 codegen 顺序保证 |
+| `pydeps` / `pyan` | AST + 完整 call graph | 静态分析文档生成 |
+| `ruff --select F401` | AST unused imports | 单文件 lint |
+| `importtime` (stdlib) | runtime profile | 性能分析, 不解决顺序 |
+
+生产推荐: dep_graph (静态) + 真实 pytest import collection (动态) 组合。
+
 ## 已知坑
 
 1. **MiniMax M3 CoT 干扰**: `with_structured_output` 主路失败时, 切备路 `_strip_think` + `PydanticOutputParser`。
@@ -255,6 +315,11 @@ written = safe_plan_to_code(llm, plan)
 17. **Demo 8 `subprocess shell=True` regex 太宽**: 当前 regex `shell\s*=\s*True` 不区分 `shell=False` 注释 / 文档字符串。 实测中 docstring 写 "shell=False is safer" 会触发 BLOCK。 AST layer 应该 parse kwarg 验证, 未来可以增强为: `Call(func=subprocess...) and any(kw.arg=='shell' and kw.value.value is True)` 才 BLOCK。
 18. **Demo 8 scanner 自扫会 meta-level 命中**: `safety.py` 自身包含 `re.compile(r"\beval\s*\(")` 等字面量, scanner 扫自己 → 命中 19 BLOCK findings。 这是预期 (meta-level), scanner "诚实" 报告自身代码里的危险 pattern。 部署时: 配置 scanner 跳过自身 source path, 或把规则定义放到独立 JSON / YAML 文件, 让 scanner 代码不含字面量 pattern。 Demo 8 step 7 演示这点。
 19. **Demo 8 multiline `open().write()` 漏报已修复 (R13 fix)**: 之前 regex `open\s*\(\s*[^)]*\)\s*\.write\s*\(` 的 `[^)]*` 不跨行, 只能抓单行 `open("x").write(...)`; 多行 `f = open("x.txt")\nf.write("hello")` 漏报。 R13 修复: AST layer 加 open_vars 跟踪, `f = open(...)` 把 `f` 加进集合, 后续 `f.write(...)` 触发 `open_write` WARN。 新增 unit test case #7 验证多行 pattern 被捕获。 局限: open_vars 不区分函数作用域, 跨 scope 复用变量名会有少量 false positive (acceptable trade-off)。
+20. **Demo 9 topological_sort 算法细节**: Kahn's algorithm 关键在"in-degree 怎么算"。 我们 graph[n] = n 依赖谁 (出边 from n → dep), 所以 in-degree(n) = len(graph[n]) = n 依赖多少个 graph 里的 node。 处理 n 时, 让所有 m where n ∈ graph[m] 的 m 的 in-degree 减 1。 同 in-degree 节点按名字 sort 保证 deterministic (同样输入总得到同样顺序, 易测试)。 第一次实现时把方向搞反过, 导致 topo 顺序颠倒, 单元测试暴露。 ⚠️ 教学要点: 在 deps-on graph 上做 topo sort, in-degree = "我依赖多少", 不是 "多少人依赖我"。
+21. **Demo 9 module name heuristic 不完美**: `_path_to_module("foo/bar/utils.py") → "utils"` 简单取文件名去 `.py`。 不支持 nested packages (e.g. `pkg/sub/utils.py` 应是 `pkg.sub.utils`)。 不看 `__init__.py` 判断包结构。 教学够用, 生产应解析实际 Python import 系统 (`astroid`, `importlib`)。 单元测试 case #2-7 覆盖基本场景。
+22. **Demo 9 cycle detection 返回所有环**: Tarjan-style DFS + normalized dedup (最小节点开头 + tuple hash)。 局限: 重复环可能 O(n²) (e.g. 3-node 完全图有 6 个不同 ring 都描述同一个 SCC)。 生产应该用 Tarjan SCC (强连通分量) 找唯一的 cycle 群。 demo 简单版够教学。
+23. **Demo 9 forward decl 不解决所有问题**: `add_forward_decls` 插 `TYPE_CHECKING` import, 只让 type checker 知道符号存在 (annotation 用), 运行时不在 → 解决 type-only cycle。 不解决 runtime cycle: `a.foo()` → `b.bar()` → `a.foo()` 仍会 ImportError / NameError (因为运行时 a 还没定义完)。 demo step 5 演示 forward decl 工具, 但 case 6 的端到端 pipeline 用 linear spec 避免 runtime cycle (LLM 不一定每次都生成 runtime-safe code)。 生产建议: dep-aware + 真实 pytest import collection + 必要时 lazy import (`def foo(): from b import x`) 兜底。
+24. **Demo 9 FileSpec 加 `extra='allow'`**: 让 `FileSpec(..., content='...')` 可以注入生成代码做 dep 分析。 LLM structured output 不会吐 `content` (content 是 file_to_code 之后产物), 所以 `model_dump()` 仍干净 (没多余字段)。 `getattr(f, "content", "")` 兜底没 content 的 FileSpec 视为空字符串。 局限: `model_dump()` 会包含 `content` 字段 (如果注入过), 生产应考虑 expose `content` 为正式字段 (with description), 或用 wrapper class。
 
 ## 跟其它模块的关系
 
