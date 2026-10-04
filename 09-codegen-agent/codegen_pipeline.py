@@ -241,8 +241,80 @@ def plan_to_code(llm, plan: Plan) -> list[Path]:
     return written
 
 
+def safe_plan_to_code(llm, plan: Plan, output_dir: Path | None = None) -> list[Path]:
+    """Plan → 写盘, 但写盘前 safety 扫描. BLOCK → 跳过该文件.
+
+    在 `plan_to_code` 基础上加 safety gate:
+      - Layer 1+2 扫描代码 (regex + AST)
+      - BLOCK 级别 finding → 拒绝写盘, 打印原因, skip
+      - WARN 级别 → 写但打印警告
+      - INFO → 静默
+
+    Args:
+        llm: LLM 实例
+        plan: Plan Pydantic 对象
+        output_dir: 输出目录 (默认 = `output_dir()` 当前模块默认目录)
+
+    Returns:
+        成功写入的文件路径列表 (BLOCK 文件被剔除).
+
+    💡 设计要点:
+      - BLOCK 跳过而不是 fail: 一个文件危险不影响其它文件
+      - 不在 safe_plan_to_code 里 raise: 让调用方决定怎么处理
+        (demo 里 print + count, 生产可以 log + alert)
+      - WARN 不阻断: 给 false-positive 兜底, 写但留下审计痕迹
+    """
+    # 延迟 import 避免循环 (safety → codegen_pipeline 反向引用)
+    from safety import format_findings, has_block_findings, scan_code, Severity
+
+    # 默认 output_dir: 复用 _common.output_dir()
+    if output_dir is None:
+        from _common import output_dir as _default_output_dir
+        output_dir = _default_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[Path] = []
+    blocked_count = 0
+    warn_count = 0
+
+    for i, file_spec in enumerate(plan.files, 1):
+        step(i, f"生成 {file_spec.path} (with safety gate)")
+        code = file_to_code(llm, file_spec)
+
+        # === Safety scan ===
+        findings = scan_code(code, file_spec.path)
+
+        if has_block_findings(findings):
+            blocked_count += 1
+            print(f"  ⛔ BLOCKED by safety scan ({len([f for f in findings if f.severity == Severity.BLOCK])} BLOCK findings)")
+            print(format_findings(findings))
+            continue  # skip 写盘
+
+        # WARN findings: log but proceed
+        warns = [f for f in findings if f.severity == Severity.WARN]
+        if warns:
+            warn_count += 1
+            print(f"  ⚠️  {len(warns)} warnings (will write anyway):")
+            for f in warns:
+                loc = f"line {f.line_no}" if f.line_no else "全文"
+                print(f"    - {f.pattern} @ {loc}: {f.snippet!r}")
+
+        # 写盘
+        path = output_dir / file_spec.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code, encoding="utf-8")
+        print(f"  ✓ 写入 {path} ({len(code)} 字符)")
+        written.append(path)
+
+    # 总结
+    total = len(plan.files)
+    print(f"\n  safe_plan_to_code 总结: 写入 {len(written)}/{total} (BLOCK 跳过 {blocked_count}, WARN {warn_count})")
+    return written
+
+
 __all__ = [
     "plan_to_code",
+    "safe_plan_to_code",
     "file_to_code",
     "code_to_test",
     "fix_code",
