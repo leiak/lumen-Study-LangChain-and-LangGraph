@@ -21,6 +21,8 @@
 | 08 | `08_spec_validation.py` | `safe_plan_to_code` + 故意危险 spec | LLM 生成代码写盘前拦截危险模式 (eval/exec/secret), 演示 3 类 spec |
 | 共享 | `dep_graph.py` | `extract_imports` (regex) + `topological_sort` (Kahn's) + `detect_cycles` (DFS) | 跨文件依赖图工具: import 提取 + 拓扑排序 + 循环检测 + forward decl |
 | 09 | `09_cross_file_deps.py` | `build_dep_graph` + `topological_sort` + `plan_to_code_with_deps` | 多文件 codegen 按依赖顺序生成, 循环依赖 raise 不 silent, 演示 6 个步骤 (3 算法 + 3 LLM 集成) |
+| 共享 | `streaming.py` | `llm.astream` + `llm.astream_events` + `time.perf_counter` | 共享 streaming 累积: `stream_llm_content` (basic) + `stream_file_code` (file-aware) + `StreamResult` dataclass + `iter_llm_tokens` async generator |
+| 10 | `10_streaming_codegen.py` | `plan_to_code_streaming` + TTFT + `astream_events` v2 | LLM token streaming codegen, 边写边预览, TTFT 测量, 5 个步骤 (3 streaming 机制 + 2 集成 + 1 bonus async-iter) |
 
 ## 推荐阅读顺序
 
@@ -48,6 +50,8 @@ codegen_pipeline.py ← 再懂"从 plan 到 code 到 test 的 pipeline"
 safety.py + 08_spec_validation.py  ← safety gate 拦截危险代码 (eval/exec/secret)
    ↓
 dep_graph.py + 09_cross_file_deps.py  ← 多文件 dep graph + 拓扑排序 + cycle detection
+   ↓
+streaming.py + 10_streaming_codegen.py  ← LLM token streaming + TTFT + UI hookup
 ```
 
 ## 跑起来
@@ -66,6 +70,7 @@ python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
 python 09-codegen-agent/07_incremental_diff.py
 python 09-codegen-agent/08_spec_validation.py
 python 09-codegen-agent/09_cross_file_deps.py
+python 09-codegen-agent/10_streaming_codegen.py
 ```
 
 每个 demo 都独立运行,运行时把生成的代码写到 `09-codegen-agent/output/` (gitignored)。
@@ -288,6 +293,59 @@ topo sort 用于"写盘顺序"而非"生成顺序", 这样 graph 反映真实 co
 
 生产推荐: dep_graph (静态) + 真实 pytest import collection (动态) 组合。
 
+## Streaming code gen (Demo 10)
+
+Demo 10 解决 codegen 的**感知延迟问题**: 用户提交 spec → 30s 沉默 → 整段代码一次性出现,
+体验像"卡死"了。 Streaming 让代码逐字浮现, 500ms 内第一个字符就出现, 像 Cursor / Copilot。
+
+**核心组件** (在 `streaming.py`):
+- **`stream_llm_content(llm, messages, on_token=None)`** — basic astream 累积: buffer list+join,
+  TTFT = `time.perf_counter()` 在第一个 chunk 时记录
+- **`stream_file_code(llm, file_spec, on_token=None)`** — file-aware: 用专用 prompt 让 LLM 输出纯代码
+  (不包 markdown fence), 走 streaming 路径
+- **`StreamResult`** dataclass — 4 fields: `content` / `ttft_seconds` / `total_seconds` / `token_count`
+- **`iter_llm_tokens(llm, messages)`** — async generator: `async for token, elapsed in ...`,
+  适合 SSE / WebSocket / 异步 pipeline
+
+**集成方式** (在 `codegen_pipeline.py`):
+```python
+from codegen_pipeline import plan_to_code_streaming
+
+# 替换 plan_to_code / safe_plan_to_code: 自动 streaming + safety
+written, results = plan_to_code_streaming(llm, plan, output_dir=out, on_token=print)
+# written: list[Path] — 写盘成功的文件 (BLOCK 跳过)
+# results: list[StreamResult] — 每个文件的 timing 数据
+```
+
+**两个 streaming API 区别**:
+| API | 粒度 | 用途 |
+|-----|------|------|
+| `llm.astream(messages)` | token-level (`AIMessageChunk.content`) | 简单 UI (SSE / print / 进度条) |
+| `llm.astream_events(messages, version="v2")` | event-level (`on_chat_model_start` / `on_llm_new_token` / `on_chat_model_end` / chain / tool / retriever) | 复杂 UI (LangSmith trace / 多 node 监控 / chain 中断) |
+
+**Demo 10 流程** (6 steps):
+1. **basic astream**: 看 token 增量, 确认 TTFT < 1s
+2. **streaming 单文件**: code char-by-char (每 20 token 一个 dot 替代纯字符-避免 terminal 乱)
+3. **TTFT 对比**: streaming vs non-streaming (感知延迟 speedup)
+4. **多文件 streaming**: `plan_to_code_streaming` 端到端 (greeter.py + main.py)
+5. **astream_events v2**: 细粒度事件流 (start / new_token / end)
+6. **iter_llm_tokens bonus**: async iterator 模式 (SSE / WebSocket 友好)
+
+**生产 UX 类比**:
+- **Cursor / Copilot inline**: streaming codegen + 实时 diff = demo 10 思路
+- **ChatGPT web**: astream_events + typing animation = step 5 思路
+- **OpenAI Playground**: async iterator + WebSocket = `iter_llm_tokens` 思路
+
+跟其它 streaming 工具对比:
+| 工具 | 类型 | 适用 |
+|------|------|------|
+| `streaming.py` (本 demo) | astream + 累积 + TTFT | LangChain 1.x standard, 教学够用 |
+| `langchain.callbacks.streaming.StdOutCallbackHandler` | callback 自动 print | 调试时方便, 没 timing |
+| `vllm` / `text-generation-inference` | LLM server side | 自部署 LLM 时用 |
+| OpenAI `stream=True` (raw) | HTTP SSE | 直接调 API, 不走 LangChain |
+
+生产推荐: LangChain `astream` (跨 provider 兼容) + 累积 buffer + 自己的 UI layer。
+
 ## 已知坑
 
 1. **MiniMax M3 CoT 干扰**: `with_structured_output` 主路失败时, 切备路 `_strip_think` + `PydanticOutputParser`。
@@ -320,6 +378,12 @@ topo sort 用于"写盘顺序"而非"生成顺序", 这样 graph 反映真实 co
 22. **Demo 9 cycle detection 返回所有环**: Tarjan-style DFS + normalized dedup (最小节点开头 + tuple hash)。 局限: 重复环可能 O(n²) (e.g. 3-node 完全图有 6 个不同 ring 都描述同一个 SCC)。 生产应该用 Tarjan SCC (强连通分量) 找唯一的 cycle 群。 demo 简单版够教学。
 23. **Demo 9 forward decl 不解决所有问题**: `add_forward_decls` 插 `TYPE_CHECKING` import, 只让 type checker 知道符号存在 (annotation 用), 运行时不在 → 解决 type-only cycle。 不解决 runtime cycle: `a.foo()` → `b.bar()` → `a.foo()` 仍会 ImportError / NameError (因为运行时 a 还没定义完)。 demo step 5 演示 forward decl 工具, 但 case 6 的端到端 pipeline 用 linear spec 避免 runtime cycle (LLM 不一定每次都生成 runtime-safe code)。 生产建议: dep-aware + 真实 pytest import collection + 必要时 lazy import (`def foo(): from b import x`) 兜底。
 24. **Demo 9 FileSpec 加 `extra='allow'`**: 让 `FileSpec(..., content='...')` 可以注入生成代码做 dep 分析。 LLM structured output 不会吐 `content` (content 是 file_to_code 之后产物), 所以 `model_dump()` 仍干净 (没多余字段)。 `getattr(f, "content", "")` 兜底没 content 的 FileSpec 视为空字符串。 局限: `model_dump()` 会包含 `content` 字段 (如果注入过), 生产应考虑 expose `content` 为正式字段 (with description), 或用 wrapper class。
+25. **Demo 10 写盘只在累积完成时**: 半截 code 不能 parse (`ast.parse` 抛 `SyntaxError`), 不能 extract (`extract_python_blocks` 正则匹配需要闭合 fence), 不能 write (写半截 = 让用户看错误代码)。 教学要点是 buffer 模式: 每个 chunk append 到 list, **迭代结束** 才 `"".join(buffer)` 走下一步。 `plan_to_code_streaming` 已经强制这个时序 (写盘只在 `await stream_file_code(...)` 返回后)。
+26. **Demo 10 `astream_events` version 必须 "v2"**: LangChain 1.x deprecated `version="v1"`, 默认值也会警告。 必须显式传 `version="v2"` 才能拿到 `on_chat_model_start` / `on_llm_new_token` / `on_chat_model_end` 等新事件。 `v1` 的 `on_llm_start` / `on_llm_token` 仍能跑, 但官方文档明确推荐迁移。 demo step 5 已显式传 `"v2"`, 跑会看到 deprecation warning 如果你忘了。
+27. **Demo 10 TTFT 受网络影响大, 不一定代表 UX 改进**: 局域网 TTFT < 100ms, 跨洲 500ms+, 但**后续 token 也要算**。 如果 total 是 5s, TTFT 0.3s, 用户感知是"5s 里前 0.3s 安静, 后 4.7s 一字写"。 跟 5s 一次性显示对比, 感知延迟改进 = 0.3s vs 5s (16x speedup)。 但如果 total 是 0.5s, TTFT 0.3s, 改进只有 0.2s, 用户感觉不明显。 教学: 看 speedup ratio + 看 absolute TTFT, 两个都要。 demo step 3 直接 print 这两个值, 让用户判断。
+28. **Demo 10 callback 不能 raise, UI 渲染要静默**: `on_token` 在 astream 循环里同步调, 抛错会打断 streaming → 后续 chunk 拿不到 → 用户卡死。 防御: `plan_to_code_streaming` 内 `_safe_on_token` wrapper 用 try/except 吞异常 (UI 渲染错不影响 codegen)。 教学: 生产 streaming UI layer 必须包 try/except, 终端 print 也要 flush (`print(t, end="", flush=True)`), 不然 buffer 卡住看起来不流畅。
+
+## 跟其它模块的关系
 
 ## 跟其它模块的关系
 
