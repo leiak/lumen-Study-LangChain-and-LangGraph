@@ -17,6 +17,8 @@
 | 05 | `05_multi_agent_coder.py` | `StateGraph` + `create_agent` + `@tool` | 3 specialist (Planner / Coder / Reviewer) + supervisor 状态机 |
 | 06 | `06_human_review.py` | `HumanInTheLoopMiddleware` + 3 HITL gates | 关键决策点 (plan / 每个文件 / fix) 加人工审批 |
 | 07 | `07_incremental_diff.py` | SEARCH/REPLACE 块 + `difflib.SequenceMatcher` 模糊匹配 | review loop 改用增量 diff (省 50%+ token, Cursor/Copilot pattern) |
+| 共享 | `safety.py` | regex + `ast` 两层扫描 | 静态安全扫描: BLOCK/WARN/INFO 三档, 默认规则覆盖 eval/exec/shell/pickle/dynamic-import |
+| 08 | `08_spec_validation.py` | `safe_plan_to_code` + 故意危险 spec | LLM 生成代码写盘前拦截危险模式 (eval/exec/secret), 演示 3 类 spec |
 
 ## 推荐阅读顺序
 
@@ -40,6 +42,8 @@ codegen_pipeline.py ← 再懂"从 plan 到 code 到 test 的 pipeline"
 06_human_review.py          ← 3 HITL gates (plan / 每个文件 / fix) 加人工审批
    ↓
 07_incremental_diff.py      ← review loop 改用增量 diff (省 50%+ token)
+   ↓
+safety.py + 08_spec_validation.py  ← safety gate 拦截危险代码 (eval/exec/secret)
 ```
 
 ## 跑起来
@@ -56,6 +60,7 @@ python 09-codegen-agent/04_review_loop.py
 python 09-codegen-agent/05_multi_agent_coder.py
 python 09-codegen-agent/06_human_review.py   # 需交互输入 (a/e/r)
 python 09-codegen-agent/07_incremental_diff.py
+python 09-codegen-agent/08_spec_validation.py
 ```
 
 每个 demo 都独立运行,运行时把生成的代码写到 `09-codegen-agent/output/` (gitignored)。
@@ -80,6 +85,9 @@ python 09-codegen-agent/07_incremental_diff.py
 13. 怎么从 `state.tasks[0].interrupts` 抽 tool_call 的 name + args? (LangChain 1.x `action_requests[0]` 格式)
 14. codegen pipeline 哪几个动作适合加 HITL gate? (plan / 每个文件 / fix — 3 个 trade-off: 安全 vs UX 累)
 15. 增量 diff (`SEARCH/REPLACE` 块 + `difflib`) 比全文件 regen 省多少 token? 什么场景应该用哪种?
+16. 为什么 LLM 生成的代码需要 safety gate? (eval/exec/secret/dynamic-import 4 类常见危险)
+17. 静态分析 (regex + AST) 跟运行时沙箱的 trade-off? (静态快但漏报, 沙箱准但重)
+18. Severity 三档 (BLOCK/WARN/INFO) 怎么选? (默认保守 BLOCK, WARN 给 false-positive 兜底)
 
 ## 复用 L1 的方式 (DRY)
 
@@ -164,6 +172,62 @@ def foo(x):
 
 生产建议: full regen 用于 first-pass (没历史上下文), incremental 用于 retry (改 1-3 行)。
 
+## Spec validation (Demo 8)
+
+Demo 8 在 `plan_to_code` 写盘前加 safety gate, 拦截 LLM 生成的危险代码。 在 `04_review_loop`
+和 `06_human_review` 只检查 "测试 pass" 的基础上, 加一层 "代码安全" 防御。
+
+**两层扫描架构** (在 `safety.py`):
+- **Layer 1 (regex)**: 全文件字符串扫描, 快 + 易读。 覆盖 `eval(`/`exec(`/`os.system(` 等明显模式
+- **Layer 2 (AST)**: `ast.parse` + 递归 walk, 准 + 处理结构化场景。 覆盖 `Call(func=Name('eval'))` 等
+
+**Severity 三档**:
+| 档位 | 行为 | 示例 |
+|------|------|------|
+| `BLOCK` | 拒绝写盘, 打印 finding | `eval(` / `exec(` / `os.system(` / `pickle.loads` / `__import__(` / `shell=True` |
+| `WARN`  | 写盘但打印警告 | hardcoded secret (`password = "..."`) / `open().write()` |
+| `INFO`  | 静默, 仅学习 | `hashlib.md5` / `hashlib.sha1` (不安全 hash) |
+
+**默认 BLOCK 规则** (12 条):
+```python
+# 直接执行任意代码
+eval(exec(compile(...                       # 表达式 / 代码注入
+# shell 注入
+os.system( shell=True                       # shell 命令注入
+# 反序列化
+pickle.loads( marshal.loads(                # 反序列化 RCE
+# 动态 import 绕过审查
+__import__( importlib.import_module(        # 绕过静态审查
+```
+
+**默认 WARN 规则** (2 条):
+- `hardcoded_secret` — `(?i)(password|secret|api_key|token)\s*=\s*['"][^'\"]{4,}['"]`
+- `open_write` — `open(...).write(` 链式调用
+
+**集成方式** (`codegen_pipeline.py`):
+```python
+from codegen_pipeline import safe_plan_to_code
+
+# 替换 plan_to_code: 自动应用 safety gate
+written = safe_plan_to_code(llm, plan)
+# BLOCK 文件被跳过, 返回写入成功的路径列表
+```
+
+跟 Demo 6 HITL 的关系:
+- HITL 是 "人类审批" — 慢但权威
+- Safety scan 是 "机器审批" — 快但粗糙
+- 生产建议: 两者结合, 扫描先过 (cheap rejection), HITL 兜底 (humans 看 ambiguous case)
+
+跟其它扫描工具对比:
+| 工具 | 类型 | 优劣 |
+|------|------|------|
+| `safety.py` (本 demo) | regex + AST 静态 | 快 / 易集成 / 启发式 |
+| `bandit` | AST + taint | 全 Python 安全规则, 误报低 |
+| `detect-secrets` | regex + entropy | secret 检测专业, false-positive 低 |
+| `RestrictedPython` | 运行时沙箱 | 准但需重构代码 |
+
+生产推荐: 静态扫描 + bandit + detect-secrets + RestrictedPython 组合, 不要单押一种。
+
 ## 已知坑
 
 1. **MiniMax M3 CoT 干扰**: `with_structured_output` 主路失败时, 切备路 `_strip_think` + `PydanticOutputParser`。
@@ -182,6 +246,14 @@ def foo(x):
 12. **Demo 7 SEARCH/REPLACE 块分隔符严格匹配**: regex 是 `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` (7 个 `<`, 7 个 `>`)。 LLM 偶尔吐变体 (e.g. `<<<< SEARCH`, `===`, `>>>>`), 解析失败 → 返回原 code (defensive)。 生产可考虑加常见变体 fallback 或要求 LLM "严格按格式"。
 13. **Demo 7 difflib threshold 0.6 太低可能误替换**: demo 用 0.6 接受更多匹配, 但 production 应该 0.8+ (e.g. Aider 默认 0.75)。 threshold 越低, 模糊匹配越多, 误替换概率越大。 防御: 同时要求 `n` 至少 2 行 (避免单行歧义)。
 14. **Demo 7 解析失败 defensive 不抛错**: LLM 没出 SEARCH/REPLACE 块时, `fix_code_incremental` 返回原 code 而不是 raise。 这避免了"上游 prompt 误导 → 下游 pipeline 全炸", 但也意味着 silent failure — 调用方应该 log + 检查返回值是否真被改了 (e.g. compare len before/after 或 hash)。
+15. **Demo 8 AST 解析失败静默**: `scan_ast` 遇到 SyntaxError 返回空 `[]`, 不抛错。 设计: regex layer 已 catch 表面错误 (e.g. eval), AST 解析失败说明代码本身畸形, 不强行扫。 局限: 复杂但语法错误的代码可能漏检, 生产可以加 `try/except` log 异常让扫描失败可见。
+16. **Demo 8 hardcoded secret 检测不完美**: 启发式 regex `(?i)(password|secret|api_key|token)\s*=\s*['"][^'\"]{4,}['"]` 会误报:
+    - 注释里 `password = "my_var_name"` (e.g. 注释解释 placeholder)
+    - 测试 fixture 里 `password = "test123"` (合法 fixture)
+    - 默认值 `password = ""` 会被 regex 漏掉 (`{4,}` 排除短字符串)
+    生产推荐接 `detect-secrets` (基于 entropy + 上下文) 而非自造 regex。
+17. **Demo 8 `subprocess shell=True` regex 太宽**: 当前 regex `shell\s*=\s*True` 不区分 `shell=False` 注释 / 文档字符串。 实测中 docstring 写 "shell=False is safer" 会触发 BLOCK。 AST layer 应该 parse kwarg 验证, 未来可以增强为: `Call(func=subprocess...) and any(kw.arg=='shell' and kw.value.value is True)` 才 BLOCK。
+18. **Demo 8 scanner 自扫会 meta-level 命中**: `safety.py` 自身包含 `re.compile(r"\beval\s*\(")` 等字面量, scanner 扫自己 → 命中 19 BLOCK findings。 这是预期 (meta-level), scanner "诚实" 报告自身代码里的危险 pattern。 部署时: 配置 scanner 跳过自身 source path, 或把规则定义放到独立 JSON / YAML 文件, 让 scanner 代码不含字面量 pattern。 Demo 8 step 7 演示这点。
 
 ## 跟其它模块的关系
 
