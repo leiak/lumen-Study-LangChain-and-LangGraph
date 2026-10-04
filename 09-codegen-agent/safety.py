@@ -111,6 +111,8 @@ _REGEX_RULES: list[tuple[re.Pattern, Severity, str, str]] = [
         "硬编码 secret/credential, 应该走环境变量或 vault",
     ),
     # --- WARN: 文件写入 path 可控 ---
+    # 单行 `open("x").write(...)` 用 regex 抓. 多行 `f = open(); f.write()`
+    # 用 AST layer 抓 (R13 fix). 两者 pattern 名都是 `open_write`, dedup 友好.
     (
         re.compile(r"open\s*\(\s*[^)]*\)\s*\.write\s*\("),
         Severity.WARN,
@@ -169,32 +171,82 @@ _AST_DANGEROUS_ATTRS = {
 }
 
 
-def _scan_ast_node(node: ast.AST, source: str) -> list[Finding]:
+def _ast_attr_pattern_name(full: tuple[str, str]) -> str:
+    """把 (module, attr) 映射成跟 regex 同名的 pattern 标识 (R13 fix).
+
+    例:
+      (os, system)        → 'os_system'      (regex: os_system)
+      (pickle, loads)     → 'pickle_load'    (regex: pickle_load)
+      (pickle, load)      → 'pickle_load'    (同上, dedup)
+      (marshal, loads)    → 'marshal_load'
+      (os, popen)         → 'os_popen'       (AST-only)
+      (subprocess, call)  → 'subprocess_call' (AST-only)
+
+    目的: 让 dedup 在 (severity, pattern, line_no) 维度能跨 regex + AST 合并.
+    之前 AST pattern 用 `ast_eval` / `ast_os_system` 等前缀, 跟 regex 不一致,
+    跨层 dedup 从不触发 (R13 review #2).
+    """
+    mod, attr = full
+    # load/loads 都映射到 {mod}_load, 跟 regex 的 pickle_load / marshal_load 对齐
+    if attr in ("loads", "load"):
+        return f"{mod}_load"
+    return f"{mod}_{attr}"
+
+
+def _scan_ast_node(
+    node: ast.AST,
+    source: str,
+    open_vars: set[str] | None = None,
+) -> list[Finding]:
     """递归 AST walk, 收集 forbidden Call 节点.
 
-    处理两类危险 call:
+    处理三类危险 call (R13 fix 加了 #3):
       1. Call(func=Name(id in _AST_FORBIDDEN_FUNCS))
          → eval / exec / compile
       2. Call(func=Attribute(value=Name, attr) 且 (name, attr) in _AST_DANGEROUS_ATTRS)
          → os.system / pickle.loads / ...
+      3. Call(func=Attribute(attr='write', value=Name)) 且 Name ∈ open_vars
+         → multiline open().write() pattern (R13 fix)
 
     Args:
         node: 当前 AST 节点
         source: 来源标识
+        open_vars: 已经赋值为 open() 调用的变量名集合 (mutable, 跨递归共享).
+                   新看到 `f = open(...)` 就把 'f' 加进来; 看到 `f.write()` 就
+                   触发 open_write finding.
 
     Returns:
         当前节点 (含子树) 的 findings 列表.
+
+    💡 简化: open_vars 集合跨整个 module 共享, 不区分函数作用域. 局限:
+      如果 `f` 被 rebind 到非-open() 值 (e.g. `f = [1,2]`), AST 仍把 `f` 视为
+      open_var. 这是 simple static analysis 的 known limitation — demo 接受
+      少量 false positive, 换简洁性.
     """
+    if open_vars is None:
+        open_vars = set()
+
     findings: list[Finding] = []
+
+    # 0. Track open() assignments (NEW R13 — multiline open_write fix)
+    if isinstance(node, ast.Assign):
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            if node.value.func.id == "open":
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        open_vars.add(target.id)
 
     if isinstance(node, ast.Call):
         func = node.func
         # 1. Bare eval/exec/compile
         if isinstance(func, ast.Name) and func.id in _AST_FORBIDDEN_FUNCS:
+            # 命名跟 regex 一致: eval_call / exec_call / compile_call
+            # 这样 dedup 在 (severity, pattern, line_no) 维度能合并
+            name = f"{func.id}_call"
             findings.append(
                 Finding(
                     severity=Severity.BLOCK,
-                    pattern=f"ast_{func.id}",
+                    pattern=name,
                     line_no=node.lineno,
                     snippet=f"call to {func.id}()",
                     reason=f"AST 检测到 {func.id}() 调用, 等价 regex 检测",
@@ -209,16 +261,28 @@ def _scan_ast_node(node: ast.AST, source: str) -> list[Finding]:
                     findings.append(
                         Finding(
                             severity=Severity.BLOCK,
-                            pattern=f"ast_{full[0]}_{full[1]}",
+                            pattern=_ast_attr_pattern_name(full),
                             line_no=node.lineno,
                             snippet=f"call to {full[0]}.{full[1]}()",
                             reason=f"AST 检测到 {full[0]}.{full[1]}()",
                         )
                     )
 
+                # 3. multiline open().write() — 跟踪 open() 赋值的变量 (NEW R13)
+                if func.attr == "write" and value.id in open_vars:
+                    findings.append(
+                        Finding(
+                            severity=Severity.WARN,
+                            pattern="open_write",
+                            line_no=node.lineno,
+                            snippet=f".write() on {value.id} (bound to open())",
+                            reason="open().write() 可被 path 注入, 应该用 with open() + path validate",
+                        )
+                    )
+
     # 递归 walk 子节点
     for child in ast.iter_child_nodes(node):
-        findings.extend(_scan_ast_node(child, source))
+        findings.extend(_scan_ast_node(child, source, open_vars))
 
     return findings
 

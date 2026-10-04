@@ -17,7 +17,9 @@ from pathlib import Path
 from langchain_core.prompts import ChatPromptTemplate
 
 from _common import extract_python_blocks, step, write_code_file
+from _common import output_dir as default_output_dir
 from plan_schema import FileSpec, FunctionSpec, Plan
+from safety import Severity, format_findings, has_block_findings, scan_code
 
 
 # ============================================================
@@ -264,13 +266,9 @@ def safe_plan_to_code(llm, plan: Plan, output_dir: Path | None = None) -> list[P
         (demo 里 print + count, 生产可以 log + alert)
       - WARN 不阻断: 给 false-positive 兜底, 写但留下审计痕迹
     """
-    # 延迟 import 避免循环 (safety → codegen_pipeline 反向引用)
-    from safety import format_findings, has_block_findings, scan_code, Severity
-
-    # 默认 output_dir: 复用 _common.output_dir()
+    # output_dir 在函数入口解析一次 (R13 fix #6), 避免每次调用重新 invoke default_output_dir()
     if output_dir is None:
-        from _common import output_dir as _default_output_dir
-        output_dir = _default_output_dir()
+        output_dir = default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
