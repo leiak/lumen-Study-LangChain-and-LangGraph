@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 
+from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -79,8 +80,7 @@ def demo_safe_tool_passes() -> None:
 
     agent_with_hitl = (
         # 用 create_agent 重新创建 — 加 HITL middleware
-        # 这里直接构造, 避免 import create_agent 在模块顶部
-        __import__("langchain.agents", fromlist=["create_agent"]).create_agent(
+        create_agent(
             model=llm,
             tools=[calculator, refund, write_note],
             middleware=[
@@ -127,7 +127,7 @@ def demo_refund_triggers_interrupt() -> None:
     checkpointer = InMemorySaver()
 
     agent_with_hitl = (
-        __import__("langchain.agents", fromlist=["create_agent"]).create_agent(
+        create_agent(
             model=llm,
             tools=[refund],
             middleware=[
@@ -175,7 +175,7 @@ def demo_write_note_approve() -> None:
     checkpointer = InMemorySaver()
 
     agent_with_hitl = (
-        __import__("langchain.agents", fromlist=["create_agent"]).create_agent(
+        create_agent(
             model=llm,
             tools=[write_note],
             middleware=[
@@ -233,7 +233,7 @@ def demo_write_note_reject() -> None:
     checkpointer = InMemorySaver()
 
     agent_with_hitl = (
-        __import__("langchain.agents", fromlist=["create_agent"]).create_agent(
+        create_agent(
             model=llm,
             tools=[write_note],
             middleware=[
@@ -287,7 +287,7 @@ def demo_refund_edit() -> None:
     checkpointer = InMemorySaver()
 
     agent_with_hitl = (
-        __import__("langchain.agents", fromlist=["create_agent"]).create_agent(
+        create_agent(
             model=llm,
             tools=[refund],
             middleware=[
