@@ -369,12 +369,15 @@ def plan_to_code_with_deps(
         code = file_to_code(llm, file_spec)
         file_codes[file_spec.path] = code
         print(f"  ({len(code)} 字符)")
+        # 打印前 8 行预览 (跟 plan_to_code 一致)
+        preview = "\n".join(code.split("\n")[:8])
+        print(f"  预览:\n{preview}\n  ...")
 
     # 2. 构建 dep graph (用真实 content) + topo sort
     print("\n  [phase 2] 构建 dep graph + 拓扑排序...")
     enriched_files = [
-        FileSpec(path=f.path, purpose=f.purpose, functions=f.functions, content=code)
-        for f, code in zip(plan.files, [file_codes[fs.path] for fs in plan.files])
+        FileSpec(path=f.path, purpose=f.purpose, functions=f.functions, content=file_codes[f.path])
+        for f in plan.files
     ]
     graph = build_dep_graph(enriched_files)
     print(f"  graph ({len(graph)} nodes):")

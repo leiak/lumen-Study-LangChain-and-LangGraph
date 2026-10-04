@@ -256,12 +256,24 @@ def add_forward_decls(content: str, dep_module: str, symbols: list[str]) -> str:
     """
     if not symbols:
         return content
-    fwd = (
-        f"from typing import TYPE_CHECKING\n"
-        f"if TYPE_CHECKING:\n"
-        f"    from {dep_module} import {', '.join(symbols)}\n"
-        f"\n"
+    # 检测已有 TYPE_CHECKING import — 避免重复 `from typing import TYPE_CHECKING`
+    has_type_checking = bool(
+        re.search(r"^\s*from\s+typing\s+import\s+.*TYPE_CHECKING", content, re.MULTILINE)
+        or re.search(r"^\s*import\s+typing\b", content, re.MULTILINE)
     )
+    if has_type_checking:
+        fwd = (
+            f"if TYPE_CHECKING:\n"
+            f"    from {dep_module} import {', '.join(symbols)}\n"
+            f"\n"
+        )
+    else:
+        fwd = (
+            f"from typing import TYPE_CHECKING\n"
+            f"if TYPE_CHECKING:\n"
+            f"    from {dep_module} import {', '.join(symbols)}\n"
+            f"\n"
+        )
     return fwd + content
 
 
