@@ -14,7 +14,7 @@ L1 `01-langchain-basics/05_retrieval.py` 讲了 vector store + basic retriever. 
 | 高级 chunking (semantic chunker) | ❌ | ✅ |
 | 评估 (precision@k / recall@k / faithfulness) | ❌ | ✅ |
 
-本模块 5 个 demo 每个讲一个, 共用 `retrievers.py / rerankers.py / evaluators.py` 三个共享模块.
+本模块 6 个 demo 每个讲一个, 共用 `retrievers.py / rerankers.py / evaluators.py / production.py` 四个共享模块.
 
 ## 学完你能回答 N 个问题
 
@@ -24,6 +24,7 @@ L1 `01-langchain-basics/05_retrieval.py` 讲了 vector store + basic retriever. 
 4. **Chunking** — Recursive vs Semantic 切分逻辑? chunk_size / overlap 经验值? 短 doc vs 长 doc?
 5. **Evaluation** — precision@k vs recall@k 公式? Faithfulness 怎么用 LLM judge? 怎么聚合多 query?
 6. **整体 pipeline** — 怎么把 hybrid + rerank + expansion 串成 production RAG? 评估在哪个环节介入?
+7. **Production patterns** — cache 为什么能省 cost? async.gather 怎么并发 retriever? p95 latency 怎么算? corpus 变大 precision/recall 怎么变?
 
 ## Demo 表
 
@@ -34,6 +35,7 @@ L1 `01-langchain-basics/05_retrieval.py` 讲了 vector store + basic retriever. 
 | `03_query_expansion.py` | HyDE + Multi-query, 配合 expansion + rerank 联合 pipeline | ✅ (需要 LLM) | `python 03_query_expansion.py` |
 | `04_chunking.py` | Recursive vs Semantic chunker 切分长 doc + retrieval 对比 | ❌ (semantic chunker 用 safe embedding) | `python 04_chunking.py` |
 | `05_evaluation.py` | precision@5 / recall@5 + faithfulness LLM judge + 报告写 output/ | LLM judge 部分需要 | `python 05_evaluation.py` |
+| `06_production_patterns.py` | production.py 共享 | caching + async batch + observability + multi-corpus | ❌ (mock async sleep) | `python 06_production_patterns.py` |
 
 ## 文件结构
 
@@ -43,11 +45,13 @@ L1 `01-langchain-basics/05_retrieval.py` 讲了 vector store + basic retriever. 
 ├── retrievers.py          BM25 + semantic + RRF fusion (3 functions + tokenize)
 ├── rerankers.py           cross_encoder_mock + llm_rerank (async)
 ├── evaluators.py          precision@k + recall@k + faithfulness_judge (async)
+├── production.py          ObservabilityMetrics + RetrievalCache (LRU) + time_operation + gather_with_metrics
 ├── 01_hybrid_search.py    Demo 1: hybrid search 对比
 ├── 02_reranking.py        Demo 2: rerank pipeline
 ├── 03_query_expansion.py  Demo 3: HyDE + multi-query + expansion+rerank 联合
 ├── 04_chunking.py         Demo 4: recursive vs semantic chunking
 ├── 05_evaluation.py       Demo 5: precision/recall/faithfulness + 报告
+├── 06_production_patterns.py  Demo 6: cache / async batch / observability / multi-corpus
 ├── README.md              本文件
 └── .gitignore             output/ + faiss/chroma 缓存
 ```
@@ -63,6 +67,7 @@ pip install rank-bm25
 # 不需要 API key 的 demo
 python 10-rag-deep-dive/01_hybrid_search.py
 python 10-rag-deep-dive/04_chunking.py
+python 10-rag-deep-dive/06_production_patterns.py  # 纯 stdlib + mock async sleep
 
 # 部分需要 LLM (cross-encoder mock 不需要)
 python 10-rag-deep-dive/02_reranking.py
@@ -74,7 +79,27 @@ python 10-rag-deep-dive/05_evaluation.py
 
 LLM provider 配置见 `01-langchain-basics/_common.py` 的 `get_llm()` — 优先级 Anthropic > DeepSeek > MiniMax > OpenAI, `.env` 配 key 即可.
 
-## 已知坑 (5 个)
+## Production patterns (Demo 6)
+
+`production.py` 4 个共享 utility, 教学 RAG 生产模式. 跟 `retrievers.py / rerankers.py` 风格一致: 纯 utility, 演示文件用 `from production import ...`.
+
+| 名字 | 作用 | 关键设计 |
+|---|---|---|
+| `ObservabilityMetrics` | 累计 cache hit/miss + latency | `@dataclass` + `@property` 算 cache_hit_rate / avg_latency / p95_latency |
+| `RetrievalCache` | In-memory LRU cache (query → hits) | `OrderedDict` + `.move_to_end` / `.popitem(last=False)`, key 用 `.strip().lower()` 标准化 |
+| `time_operation` | Context manager 测耗时 | `time.perf_counter()` 包裹, 可选 append 到 metrics |
+| `gather_with_metrics` | async.gather + 收集各 task latency | `return_exceptions=True` 让部分失败不 abort, 每个 task 单独计时 |
+
+Demo 6 7 个 step:
+1. **Cache basic** — 同一 query 跑 2 次, 看 hit
+2. **LRU eviction** — max_size=3 插 5 个, 最旧的 2 个被淘汰
+3. **Metrics summary** — cache_hit_rate + avg/p95 latency
+4. **Multi-corpus eval** — 同 query 在 10-doc vs 20-doc corpus 对比
+5. **Cache key normalization** — 大小写 / 空格 都不影响命中
+6. **Production pipeline (sync)** — cache + retrieve + observe 串成 5-query pipeline
+7. **Async batch** — 3 retriever (BM25 + semantic + HyDE) 并发, 3 倍 speedup
+
+## 已知坑 (9 个)
 
 ### 1. RRF 的 k_constant 选 60 还是 20?
 
@@ -115,6 +140,38 @@ LLM provider 配置见 `01-langchain-basics/_common.py` 的 `get_llm()` — 优�
 **原因**: relevant 集合基数小 (1), 5 个 doc 中 1 个 relevant → precision 粒度就是 0.2. corpus 再大点 (100 docs) 就稳定.
 
 **实战**: 教学 corpus 故意小, 让 demo 在几秒内跑完. 真实 eval 至少 50-100 queries + 每 query 多个 relevant docs. 用 `eval_queries` 模板扩 ground truth.
+
+### 6. Cache 不感知 corpus 变化 — 同一 query 命中旧 hits
+
+**现象**: 索引更新 (e.g. 重新 ingest doc) 后, 同一 query 还是返回旧 hits.
+
+**原因**: `RetrievalCache` key 只用 query 字符串, 不含 corpus 版本. 命中就直接拿旧 value, 不重新检索.
+
+**实战**: 生产应加 `version_key` (e.g. corpus hash / index timestamp) → cache key = `(version, query)`. 版本变 → 全 cache 失效. demo 简化了, 单 corpus 场景足够.
+
+### 7. `asyncio.gather` 失败传染 — demo 用 `return_exceptions=True` 兜底
+
+**现象**: 默认 `asyncio.gather(*tasks)` 一个 raise 其它全 cancelled (gathering 立刻 abort).
+
+**原因**: gather 是 "all-or-nothing" — 默认一个抛就全抛.
+
+**实战**: demo 用 `return_exceptions=True` 让部分失败不 abort, 失败 task 返回 exception 对象. 生产还应加 `asyncio.wait_for(timeout=...)` 防 hang + 失败 task 自动 retry.
+
+### 8. LRU 上限 1000 是经验值 — corpus 大小决定, 没有 silver bullet
+
+**现象**: 内存涨 / 命中率低 / 抖动, 但没调过 `max_size`.
+
+**原因**: max_size 是 cache 容量上限. corpus 大 / query 长尾 → 1000 可能太大 (内存) 也可能太小 (命中率低).
+
+**实战**: 监控 `cache_hit_rate` + 内存占用. 一般经验: max_size = 预期 unique query 数 * 2. 命中率达 80%+ 算合格. 太低考虑用 Redis 持久化, 太高考虑加 TTL.
+
+### 9. p95 latency 计算 O(n log n) — 生产用 streaming estimator
+
+**现象**: 每次 `summary()` 都 sort `latencies_seconds`, 调用频繁时 CPU 涨.
+
+**原因**: `sorted()` 每次都重算 O(n log n). latency 累计 10w+ 条时, 每次 summary 都 sort 是浪费.
+
+**实战**: 生产用 streaming percentile estimator (e.g. t-digest, HDR histogram). append O(1), query O(1). demo 教学简化, 数据量小 (10 条内) sort 开销可接受.
 
 ## 进阶阅读
 
