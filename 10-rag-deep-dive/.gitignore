@@ -1,0 +1,4 @@
+output/
+*.faiss
+*.chroma
+__pycache__/
