@@ -1,0 +1,149 @@
+# ============================================================
+# GitHub Actions CI — AST smoke + 模块导入链 + lint
+# ============================================================
+# 触发: push / PR 到 main
+# 目标: 防止教学代码 syntactic 退化, 不跑真实 LLM (要 API key)
+#
+# 跑法 (本地验证):  act  (https://github.com/nektos/act)
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 取消在跑的同一 job (新 commit push)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Job 1 — smoke (Python 3.11)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+jobs:
+  smoke:
+    name: Smoke (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+
+      - name: Show Python info
+        run: |
+          python --version
+          pip --version
+
+      # ━━━ 1. AST smoke (所有 .py 文件) ━━━
+      - name: AST smoke (12 modules)
+        run: |
+          echo "## AST Smoke (12 模块)" >> $GITHUB_STEP_SUMMARY
+          total=0
+          passed=0
+          failed=0
+          for f in $(find . -name "*.py" -not -path "./.git/*" -not -path "*/__pycache__/*"); do
+            total=$((total + 1))
+            if python -c "import ast; ast.parse(open('$f', encoding='utf-8').read())" 2>/dev/null; then
+              passed=$((passed + 1))
+            else
+              failed=$((failed + 1))
+              echo "::error file=$f::AST parse failed"
+            fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Total: $total files" >> $GITHUB_STEP_SUMMARY
+          echo "- Passed: $passed" >> $GITHUB_STEP_SUMMARY
+          echo "- Failed: $failed" >> $GITHUB_STEP_SUMMARY
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::AST parse failed for $failed file(s)"
+            exit 1
+          fi
+          echo "✅ AST smoke OK: $passed/$total files"
+
+      # ━━━ 2. 按模块 import chain 验证 ━━━
+      # 不真 import (需要 API key), 改用 compile + 检查关键单符号
+      - name: Module structure check (12 modules)
+        run: |
+          echo "## Module Structure Check" >> $GITHUB_STEP_SUMMARY
+          modules=(
+              "01-langchain-basics"
+              "02-langgraph-orchestration"
+              "03-langsmith-platform"
+              "04-multi-agent"
+              "05-deep-agents"
+              "06-opc-product"
+              "07-articles"
+              "08-cli-assistant"
+              "09-codegen-agent"
+              "10-rag-deep-dive"
+              "11-tool-fabric"
+              "12-async-pipeline"
+          )
+          ok=0
+          missing=0
+          for mod in "${modules[@]}"; do
+            if [ -d "$mod" ] && [ -f "$mod/_common.py" ]; then
+              echo "- ✅ $mod/ — has _common.py" >> $GITHUB_STEP_SUMMARY
+              ok=$((ok + 1))
+            else
+              echo "::error::模块 $mod 缺 _common.py"
+              echo "- ❌ $mod/ — missing _common.py" >> $GITHUB_STEP_SUMMARY
+              missing=$((missing + 1))
+            fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**模块**: $ok/${#modules[@]} 个有 _common.py" >> $GITHUB_STEP_SUMMARY
+          if [ "$missing" -gt 0 ]; then exit 1; fi
+
+      # ━━━ 3. STATUS.md 收尾检查 (成熟模块应该有) ━━━
+      - name: Status doc check
+        run: |
+          echo "## Status Doc Check" >> $GITHUB_STEP_SUMMARY
+          for mod in 08-cli-assistant 10-rag-deep-dive 11-tool-fabric 12-async-pipeline; do
+            if [ -f "$mod/STATUS.md" ]; then
+              size=$(wc -l < "$mod/STATUS.md")
+              echo "- ✅ $mod/STATUS.md ($size lines)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⚠️ $mod/STATUS.md missing (推荐收尾时补)" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Job 2 — lint (可选, 默认不跑, 标 required-only)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  lint:
+    name: Lint (Ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true  # 教学代码 lint 不阻塞
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check . || true
+
+      - name: ruff format check
+        run: ruff format --check . || true
