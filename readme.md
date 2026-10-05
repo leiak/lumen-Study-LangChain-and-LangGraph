@@ -17,6 +17,7 @@ pip install -e .
 pip install -e ".[async]"   # 12-async-pipeline 用的 FastAPI / uvicorn / websockets
 pip install -e ".[cli]"     # 08-cli-assistant MySQL 用的 sqlalchemy
 pip install -e ".[eval]"    # deepeval 离线评估
+pip install -e ".[mcp]"     # 13-mcp-protocol 用的 mcp SDK + langchain-mcp-adapters
 pip install -e ".[all]"     # 全部
 
 # 或直接用 requirements.txt
@@ -82,6 +83,7 @@ docker run --rm -p 8000:8000 \
 | 10 | [RAG Deep Dive](10-rag-deep-dive/) | Hybrid / Rerank / Expansion / Chunking / Eval (6 demo) | `python 10-rag-deep-dive/01_hybrid_search.py` | [STATUS](10-rag-deep-dive/STATUS.md) |
 | 11 | [Tool Fabric](11-tool-fabric/) | 复杂 schema / 并行 / 错误恢复 / middleware / HITL / composition (6 demo) | `python 11-tool-fabric/01_basic_tools.py` | [STATUS](11-tool-fabric/STATUS.md) |
 | 12 | [Async Pipeline](12-async-pipeline/) | astream / gather / async-tool / SSE / WebSocket / 全链路 (6 demo) | `python 12-async-pipeline/01_astream_modes.py` | [STATUS](12-async-pipeline/STATUS.md) |
+| 13 | [MCP Protocol](13-mcp-protocol/) | FastMCP stdio/HTTP / 3 primitive / 多 server / pool / FastAPI 集成 (6 demo) | `python 13-mcp-protocol/01_basic_server.py` | [STATUS](13-mcp-protocol/STATUS.md) |
 
 ### 推荐学习顺序
 
@@ -93,9 +95,11 @@ docker run --rm -p 8000:8000 \
 09 (codegen 深度方向)  → 10 (RAG 深度方向)
    ↓
 11 (tool calling 深度方向) → 12 (async 生产架构)
+   ↓
+13 (MCP 跨进程 tool 协议 — 11 的远房兄弟)
 ```
 
-每个模块独立, 互不强依赖. L1-L6 是基础, 08-12 是 12 个**深度优先**探索方向.
+每个模块独立, 互不强依赖. L1-L6 是基础, 08-13 是 13 个**深度优先**探索方向.
 
 ### 添加新模块
 

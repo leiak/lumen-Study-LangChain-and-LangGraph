@@ -70,6 +70,11 @@ async = [
     "uvicorn[standard]>=0.32",
     "websockets>=15.0",
 ]
+# 13-mcp-protocol (MCP Python SDK + LangChain 桥 + ASGI)
+mcp = [
+    "mcp>=1.30",
+    "langchain-mcp-adapters>=0.3.2",
+]
 # 离线评估 (10-rag-deep-dive demo 5 + 任意模块)
 eval = [
     "deepeval>=2.0",
@@ -83,7 +88,7 @@ dev = [
 ]
 # 全部可选
 all = [
-    "lumen-langchain-langgraph[cli,async,eval,dev]",
+    "lumen-langchain-langgraph[cli,async,eval,mcp,dev]",
 ]
 
 # ============================================================

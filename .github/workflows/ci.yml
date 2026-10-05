@@ -50,9 +50,9 @@ jobs:
           pip --version
 
       # ━━━ 1. AST smoke (所有 .py 文件) ━━━
-      - name: AST smoke (12 modules)
+      - name: AST smoke (13 modules)
         run: |
-          echo "## AST Smoke (12 模块)" >> $GITHUB_STEP_SUMMARY
+          echo "## AST Smoke (13 模块)" >> $GITHUB_STEP_SUMMARY
           total=0
           passed=0
           failed=0
@@ -77,7 +77,7 @@ jobs:
 
       # ━━━ 2. 按模块 import chain 验证 ━━━
       # 不真 import (需要 API key), 改用 compile + 检查关键单符号
-      - name: Module structure check (12 modules)
+      - name: Module structure check (13 modules)
         run: |
           echo "## Module Structure Check" >> $GITHUB_STEP_SUMMARY
           modules=(
@@ -93,6 +93,7 @@ jobs:
               "10-rag-deep-dive"
               "11-tool-fabric"
               "12-async-pipeline"
+              "13-mcp-protocol"
           )
           ok=0
           missing=0
@@ -114,7 +115,7 @@ jobs:
       - name: Status doc check
         run: |
           echo "## Status Doc Check" >> $GITHUB_STEP_SUMMARY
-          for mod in 08-cli-assistant 10-rag-deep-dive 11-tool-fabric 12-async-pipeline; do
+          for mod in 08-cli-assistant 10-rag-deep-dive 11-tool-fabric 12-async-pipeline 13-mcp-protocol; do
             if [ -f "$mod/STATUS.md" ]; then
               size=$(wc -l < "$mod/STATUS.md")
               echo "- ✅ $mod/STATUS.md ($size lines)" >> $GITHUB_STEP_SUMMARY
