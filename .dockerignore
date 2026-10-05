@@ -1,0 +1,58 @@
+# ============================================================
+# .dockerignore — Docker build 上下文排除
+# ============================================================
+
+# 版本控制
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python 缓存 (image 里重新生成)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# 测试 (image 跑生产 demo, 不跑测试)
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Lint / Type-check cache
+.ruff_cache/
+.mypy_cache/
+
+# 文档构建 (image 不需要)
+docs/build/
+docs/_build/
+
+# Secrets / 数据 (image 注入通过 env, 不 bake 进 image)
+.env
+.env.local
+.env.*.local
+secrets/
+
+# MySQL 数据 (08-cli-assistant 跑本地 MySQL 用)
+08-cli-assistant/data/
+*.log
+
+# Demo 输出 (每个模块都有 output/ 目录)
+*/output/
+
+# Docker / CI 配置本身
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Markdown 大文件 (README 在 image 里不需要)
+LICENSE
+CHANGELOG.md
+CONTRIBUTING.md

@@ -1,0 +1,154 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ============================================================
+# PEP 621 标准项目元数据
+# ============================================================
+[project]
+name = "lumen-langchain-langgraph"
+version = "0.1.0"
+description = "2026 年 LangChain 1.x + LangGraph 1.x 实战教程 (12 模块, 50+ demo)"
+readme = "readme.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["langchain", "langgraph", "agent", "ai", "tutorial", "rag", "async"]
+authors = [
+    {name = "leiak", email = "leiak@example.com"},
+]
+# 注意: 本仓库是多模块教学代码, 不是单一 package.
+# 每个模块 (01-langchain-basics/ ... 12-async-pipeline/) 是独立运行的 demo 目录, 不是 importable package.
+# 所以下面没有 [tool.setuptools] packages 配置 — 这是有意的.
+
+# ============================================================
+# 核心依赖 — 跟 requirements.txt 对齐 (lockstep 规则见 requirements.txt 注释)
+# ============================================================
+dependencies = [
+    # LangChain 1.x + LangGraph 1.x (lockstep 见 requirements.txt 详细注释)
+    "langchain==1.0.2",
+    "langchain-core>=1.6,<2.0",
+    "langchain-openai>=1.0,<2.0",      # OpenAI 兼容 (含 MiniMax / DeepSeek / 其它)
+    "langchain-ollama>=1.0,<2.0",      # 本地 (可选)
+    "langchain-text-splitters>=1.0,<2.0",
+    "langchain-community<1.0",          # community 0.3.x, 1.0 不兼容
+    "langgraph>=1.2,<2.0",
+    "langgraph-checkpoint>=2.0,<5.0",   # 持久化
+    "langgraph-supervisor>=0.0.31",     # L4 supervisor (08 在用)
+    "langsmith>=0.4",
+    "deepagents>=0.1",                  # L5 deep agents
+
+    # 数据 / 工具
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "rich>=13.0",
+
+    # 向量库 (RAG)
+    "faiss-cpu>=1.8",
+    "rank-bm25>=0.2.2",                 # 10-rag-deep-dive 用
+    "langchain-experimental>=0.4",      # SemanticChunker
+
+    # MySQL (08-cli-assistant DataAgent)
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+    "sqlparse>=0.4",
+]
+
+# ============================================================
+# 可选依赖 — 按模块拆, 减少 base install
+# ============================================================
+[project.optional-dependencies]
+# 08-cli-assistant 端到端 CLI (含 MySQL)
+cli = [
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+    "sqlparse>=0.4",
+]
+# 12-async-pipeline (FastAPI / uvicorn / WebSocket)
+async = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "websockets>=15.0",
+]
+# 离线评估 (10-rag-deep-dive demo 5 + 任意模块)
+eval = [
+    "deepeval>=2.0",
+]
+# 开发工具 (lint / format / type-check)
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# 全部可选
+all = [
+    "lumen-langchain-langgraph[cli,async,eval,dev]",
+]
+
+# ============================================================
+# 入口点
+# ============================================================
+# 注: 本仓库是多模块教学代码, 各模块 (01-langchain-basics/, 08-cli-assistant/, ...) 是独立目录,
+# 不是 importable package. 所以没有 [project.scripts].
+# 跑法: cd 进模块目录, `python main.py` 或 `python XX_demo.py`.
+# 例: `cd 08-cli-assistant && python main.py`
+
+# ============================================================
+# URLs
+# ============================================================
+[project.urls]
+Homepage = "https://github.com/leiak/lumen-Study-LangChain-and-LangGraph"
+Repository = "https://github.com/leiak/lumen-Study-LangChain-and-LangGraph"
+Issues = "https://github.com/leiak/lumen-Study-LangChain-and-LangGraph/issues"
+
+# ============================================================
+# 配置 — ruff (Linter + Formatter)
+# ============================================================
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+    "**/output/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+]
+
+[tool.ruff.lint]
+# 教学代码, 宽松点
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line too long (docstring 长行)
+    "B008",  # 函数调用在默认参数 (FastAPI Depends 等会用)
+]
+# 教学代码允许: 未使用 import (注释) / 长行 (docstring) / print (debug)
+
+[tool.ruff.lint.per-file-ignores]
+# demo 入口允许 print / 未使用变量
+"**/0?_*.py" = ["T201", "F841"]
+"**/demo/*.py" = ["T201"]
+
+# ============================================================
+# 配置 — pytest
+# ============================================================
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+asyncio_mode = "auto"
+markers = [
+    "integration: needs API key (deselect with -m 'not integration')",
+    "slow: slow tests",
+]
+
+# ============================================================
+# 配置 — mypy (类型检查)
+# ============================================================
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+# 教学代码不强求类型
+disallow_untyped_defs = false
